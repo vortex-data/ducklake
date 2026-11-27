@@ -9,6 +9,8 @@
 #pragma once
 
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "common/index.hpp"
 #include "common/local_change.hpp"
@@ -16,6 +18,7 @@
 
 namespace duckdb {
 struct SetCommentInfo;
+struct SetColumnCommentInfo;
 class DuckLakeTransaction;
 
 class DuckLakeViewEntry : public ViewCatalogEntry {
@@ -46,12 +49,19 @@ public:
 	string ToSQL() const override;
 
 	void BindView(ClientContext &context, BindViewAction action = BindViewAction::BIND_IF_UNBOUND) override;
+	//! Returns an unbound copy without parsing SQL
+	unique_ptr<DuckLakeViewEntry> CopyUnbound() const;
 
-	string GetQuerySQL();
+	string GetQuerySQL() const;
+	bool HasColumnComments() const {
+		return has_column_comments;
+	}
 
 public:
 	// ALTER VIEW
-	DuckLakeViewEntry(DuckLakeViewEntry &parent, CreateViewInfo &info, LocalChange local_change);
+	DuckLakeViewEntry(const DuckLakeViewEntry &parent, CreateViewInfo &info, LocalChange local_change);
+
+	unique_ptr<CatalogEntry> Alter(DuckLakeTransaction &transaction, SetColumnCommentInfo &info);
 
 private:
 	unique_ptr<SelectStatement> ParseSelectStatement() const;
@@ -62,6 +72,7 @@ private:
 	string view_uuid;
 	string query_sql;
 	LocalChange local_change;
+	bool has_column_comments;
 };
 
 } // namespace duckdb

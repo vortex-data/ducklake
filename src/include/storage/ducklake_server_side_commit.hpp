@@ -1,0 +1,135 @@
+#pragma once
+
+#include "common/ducklake_data_file.hpp"
+#include "common/ducklake_snapshot.hpp"
+#include "duckdb/common/common.hpp"
+#include "duckdb/main/connection.hpp"
+#include "storage/ducklake_metadata_info.hpp"
+#include "storage/ducklake_staged_commit.hpp"
+#include "storage/ducklake_stats.hpp"
+#include "storage/ducklake_transaction.hpp"
+#include "storage/ducklake_transaction_changes.hpp"
+#include "storage/ducklake_transaction_state.hpp"
+
+#include <map>
+#include <vector>
+
+namespace duckdb {
+class ClientContext;
+
+struct DuckLakeServerSideCommitResult {
+	int64_t committed_snapshot_id = 0;
+	int64_t committed_schema_version = 0;
+	bool had_flushes = false;
+};
+
+//! Executes a DuckLake commit server-side from staged tables.
+class DuckLakeServerSideCommit {
+public:
+	DuckLakeServerSideCommit(ClientContext &context, Identifier metadata_schema_name, int64_t schema_version);
+
+	//! Transform staged tables to Objects and commit.
+	DuckLakeServerSideCommitResult Run();
+	//! Override the retry configuration
+	void SetRetryConfigOverride(const DuckLakeRetryConfig &retry_config);
+	//! The staged files belong to the client of a server that passed on the commit, which removes them itself
+	void SetFilesOwnedByClient(bool files_owned_by_client);
+	//! What is known about the publication of the commit, also after it failed
+	DuckLakeCommitOutcome GetCommitOutcome() const {
+		return commit_outcome;
+	}
+
+private:
+	//! Read commit metadata (author, message, snapshot ids).
+	void ReadCommitHeader();
+	//! Read staged dropped file rows once and cache them.
+	void ReadStagedDroppedFileEntries();
+	//! Load column types for every table touched in this commit.
+	void ReadColumnTypes();
+	//! Read staged data files and their per-file column stats.
+	void ReadStagedDataFiles();
+	//! Read staged inlined data rows, row ids, and column stats.
+	void ReadStagedInlinedData();
+	//! Read staged inlined row deletes grouped by table.
+	void ReadStagedInlinedDeletes();
+	//! Read staged inlined file-level deletes grouped by table.
+	void ReadStagedInlinedFileDeletes();
+	//! Read staged delete files not attached to data files.
+	void ReadStagedDeleteFiles();
+	//! Read staged dropped file paths and tables deleted from.
+	void ReadStagedDroppedFiles();
+	//! Read staged flushed inlined table entries.
+	void ReadStagedFlushedInlinedTables();
+	//! Read staged compaction headers and their source files.
+	void ReadStagedCompactions();
+	//! Read staged name maps and rebuild entry trees.
+	void ReadStagedNameMaps();
+	//! The current global stats of a table, read from the metadata catalog when first asked for
+	shared_ptr<DuckLakeTableStats> GetExistingTableStats(TableIndex table_id);
+
+	//! Query the metadata catalog for the latest snapshot.
+	DuckLakeSnapshot ReadLatestSnapshot();
+	//! The version of the metadata schema, which picks the texts of the commit.
+	DuckLakeVersion ReadCatalogVersion();
+	//! Whether a lookup on snapshot_id names the branch of main, decided by the engine of the metadata database
+	bool BranchKeyedLookups() const;
+	//! Build a DuckLakeTableStats from parsed global stats.
+	unique_ptr<DuckLakeTableStats> BuildTableStats(const DuckLakeGlobalStatsInfo &gs);
+	//! Build a full DuckLakeStats map from global stats.
+	unique_ptr<DuckLakeStats> BuildStatsMap(vector<DuckLakeGlobalStatsInfo> &global_stats);
+	//! Assemble the DuckLakeCommitContext with all closures.
+	DuckLakeCommitContext BuildContext(idx_t &committed_snapshot_id, idx_t &committed_schema_version);
+	//! Build INSERT SQL from staged inlined tuples.
+	string BuildInlinedDataInserts(const vector<DuckLakeInlinedDataInfo> &new_data);
+	//! Resolve and cache the latest inlined-data table name.
+	const Identifier &ResolveInlinedTableName(TableIndex table_id);
+	//! All inlined-data table names registered for a table id (any schema version).
+	vector<Identifier> LookupInlinedTableNames(TableIndex table_id);
+	//! Replace {METADATA_CATALOG}, {SNAPSHOT_ID}, etc. in SQL.
+	string SubstitutePlaceholders(string sql, const DuckLakeSnapshot &snapshot) const;
+	bool InlinedFileDeletionTableExists(TableIndex table_id);
+	//! Execute a query on the fresh connection; throw on error.
+	unique_ptr<QueryResult> RunQuery(const string &query, const char *what);
+	//! Scan a temporary staging table via the catalog API (no SQL, no lock).
+	unique_ptr<QueryResult> ScanStagedTable(DuckLakeStagedTableType kind);
+
+private:
+	ClientContext &context;
+	const Identifier metadata_schema_name;
+	const string schema_id;
+	const int64_t schema_version;
+	Connection fresh_conn;
+	DuckLakeRetryConfig retry_config;
+	bool files_owned_by_client = false;
+	DuckLakeCommitOutcome commit_outcome = DuckLakeCommitOutcome::NOT_PUBLISHED;
+
+	DuckLakeNameMapSet new_name_maps;
+	unique_ptr<DuckLakeTransactionState> state;
+	DuckLakeSnapshot transaction_snapshot;
+	TransactionChangeInformation transaction_changes;
+	map<pair<TableIndex, FieldIndex>, LogicalType> column_types;
+	map<TableIndex, shared_ptr<DuckLakeTableStats>> existing_table_stats;
+	//! The tables the commit writes, whose stats are read together
+	vector<TableIndex> commit_tables;
+	bool supports_v1_1_metadata = false;
+	bool supports_v2_0_metadata = false;
+	bool supports_file_visibility_events = false;
+	bool supports_row_visibility = false;
+	bool branch_keyed_lookups = false;
+	bool staged_dropped_files_read = false;
+	vector<pair<string, idx_t>> staged_dropped_files;
+	map<TableIndex, DroppedDataFileStats> staged_dropped_file_stats;
+
+	//! Per-table SQL literal tuples for inlined-data inserts.
+	map<TableIndex, vector<string>> staged_inlined_tuples;
+	//! Parallel row_ids for update-inlining; empty if !HasPreservedRowIds.
+	map<TableIndex, vector<int64_t>> staged_inlined_row_ids;
+	//! Cache of inlined_table_name lookups across the commit retry loop.
+	map<idx_t, Identifier> inlined_table_name_cache;
+	//! Delete files attached to transaction-local data files.
+	map<idx_t, vector<DuckLakeDeleteFile>> attached_deletes;
+	//! Compaction-output files indexed by compaction_id, then ordered by file_order.
+	map<idx_t, map<idx_t, DuckLakeDataFile>> compaction_output_files;
+};
+
+} // namespace duckdb

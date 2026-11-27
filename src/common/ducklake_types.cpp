@@ -4,6 +4,9 @@
 #include "duckdb/common/array.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/types/decimal.hpp"
+#include "duckdb/parser/expression/type_expression.hpp"
+#include "storage/ducklake_metadata_info.hpp"
 
 namespace duckdb {
 
@@ -12,7 +15,7 @@ struct DefaultType {
 	LogicalTypeId id;
 };
 
-using ducklake_type_array = std::array<DefaultType, 32>;
+using ducklake_type_array = std::array<DefaultType, 34>;
 
 static constexpr const ducklake_type_array DUCKLAKE_TYPES {{{"boolean", LogicalTypeId::BOOLEAN},
                                                             {"int8", LogicalTypeId::TINYINT},
@@ -37,6 +40,7 @@ static constexpr const ducklake_type_array DUCKLAKE_TYPES {{{"boolean", LogicalT
                                                             {"timestamp_ns", LogicalTypeId::TIMESTAMP_NS},
                                                             {"timestamp_s", LogicalTypeId::TIMESTAMP_SEC},
                                                             {"timestamptz", LogicalTypeId::TIMESTAMP_TZ},
+                                                            {"timestamptz_ns", LogicalTypeId::TIMESTAMP_TZ_NS},
                                                             {"timetz", LogicalTypeId::TIME_TZ},
                                                             {"interval", LogicalTypeId::INTERVAL},
                                                             {"varchar", LogicalTypeId::VARCHAR},
@@ -45,6 +49,7 @@ static constexpr const ducklake_type_array DUCKLAKE_TYPES {{{"boolean", LogicalT
                                                             {"struct", LogicalTypeId::STRUCT},
                                                             {"map", LogicalTypeId::MAP},
                                                             {"list", LogicalTypeId::LIST},
+                                                            {"null", LogicalTypeId::SQLNULL},
                                                             {"unknown", LogicalTypeId::UNKNOWN}}};
 
 static LogicalType ParseBaseType(const string &str) {
@@ -76,26 +81,58 @@ static string ToStringBaseType(const LogicalType &type) {
 	throw InvalidInputException("Failed to convert DuckDB type to DuckLake - unsupported type %s", type);
 }
 
-bool DuckLakeTypes::RequiresCast(const LogicalType &type) {
-	// There are no types that requires casts as of DuckDB v1.5
-	return false;
+bool DuckLakeTypes::IsStringType(const LogicalType &type) {
+	return type.id() == LogicalTypeId::VARCHAR || type.id() == LogicalTypeId::BLOB;
 }
 
-bool DuckLakeTypes::RequiresCast(const vector<LogicalType> &types) {
-	for (auto &type : types) {
-		if (RequiresCast(type)) {
-			return true;
+bool DuckLakeTypes::IsNested(const LogicalType &type) {
+	return type.IsNested() && type.id() != LogicalTypeId::VARIANT;
+}
+
+static LogicalType BindDuckLakeTypes(const LogicalType &type) {
+	return TypeVisitor::VisitReplace(type, [](const LogicalType &child) {
+		if (child.id() != LogicalTypeId::UNBOUND) {
+			return child;
+		}
+		auto &type_expr = UnboundType::GetTypeExpression(child)->Cast<TypeExpression>();
+		return DuckLakeTypes::FromString(type_expr.GetTypeName().GetIdentifierName());
+	});
+}
+
+LogicalType DuckLakeTypes::FromDuckDBString(const string &type) {
+	return BindDuckLakeTypes(UnboundType::TryParseAndDefaultBind(type));
+}
+
+LogicalType DuckLakeTypes::FromDuckDBString(const string &type, ClientContext &context) {
+	try {
+		// the Parquet reader creates types like JSON without their extension, so bind them without the catalog
+		return FromDuckDBString(type);
+	} catch (InvalidInputException &) {
+		// types like GEOMETRY with a coordinate system need the client context
+		return BindDuckLakeTypes(TransformStringToLogicalType(type, context));
+	}
+}
+
+//! Parse a DECIMAL width or scale: the whole token must be digits (surrounding spaces allowed)
+static bool TryParseDecimalMember(string member, uint64_t &result) {
+	StringUtil::Trim(member);
+	// at most 18 digits so that the value fits in uint64_t; out of range values fail the range check below
+	if (member.empty() || member.size() > 18) {
+		return false;
+	}
+	for (auto c : member) {
+		if (!StringUtil::CharacterIsDigit(c)) {
+			return false;
 		}
 	}
-	return false;
-}
-
-LogicalType DuckLakeTypes::GetCastedType(const LogicalType &type) {
-	// There are no types that requires casts as of DuckDB v1.5
-	return type;
+	result = std::stoull(member);
+	return true;
 }
 
 LogicalType DuckLakeTypes::FromString(const string &type) {
+	if (StringUtil::CIEquals(type, "decimal")) {
+		throw InvalidInputException("Invalid DECIMAL type \"%s\" - expected width and scale", type);
+	}
 	if (StringUtil::StartsWith(type, "decimal(") && StringUtil::EndsWith(type, ")")) {
 		// decimal - parse width/scale
 		string decimal_members_str = type.substr(8, type.size() - 9);
@@ -103,11 +140,48 @@ LogicalType DuckLakeTypes::FromString(const string &type) {
 		if (decimal_members_vect.size() != 2) {
 			throw NotImplementedException("Invalid DECIMAL type - expected width and scale");
 		}
-		auto width = std::stoull(decimal_members_vect[0]);
-		auto scale = std::stoull(decimal_members_vect[1]);
-		return LogicalType::DECIMAL(width, scale);
+		uint64_t width;
+		uint64_t scale;
+		if (!TryParseDecimalMember(decimal_members_vect[0], width) ||
+		    !TryParseDecimalMember(decimal_members_vect[1], scale)) {
+			throw InvalidInputException("Invalid DECIMAL type \"%s\" - width and scale must be numbers", type);
+		}
+		if (width < 1 || width > Decimal::MAX_WIDTH_DECIMAL || scale > width) {
+			throw InvalidInputException("Invalid DECIMAL type \"%s\" - width must be between 1 and %d and scale must "
+			                            "not exceed the width",
+			                            type, Decimal::MAX_WIDTH_DECIMAL);
+		}
+		return LogicalType::DECIMAL(NumericCast<uint8_t>(width), NumericCast<uint8_t>(scale));
 	}
 	return ParseBaseType(type);
+}
+
+LogicalType DuckLakeTypes::FromColumnInfo(const DuckLakeColumnInfo &col) {
+	auto type = FromString(col.type);
+	switch (type.id()) {
+	case LogicalTypeId::STRUCT: {
+		child_list_t<LogicalType> child_types;
+		for (auto &child : col.children) {
+			child_types.emplace_back(child.name, FromColumnInfo(child));
+		}
+		return LogicalType::STRUCT(std::move(child_types));
+	}
+	case LogicalTypeId::LIST:
+		if (col.children.size() != 1) {
+			throw InvalidInputException("Lists must have a single child entry");
+		}
+		return LogicalType::LIST(FromColumnInfo(col.children[0]));
+	case LogicalTypeId::MAP:
+		if (col.children.size() != 2) {
+			throw InvalidInputException("Maps must have two child entries");
+		}
+		return LogicalType::MAP(FromColumnInfo(col.children[0]), FromColumnInfo(col.children[1]));
+	default:
+		if (!col.children.empty()) {
+			throw InvalidInputException("Unrecognized nested type \"%s\"", col.type);
+		}
+		return type;
+	}
 }
 
 string DuckLakeTypes::ToString(const LogicalType &type) {
@@ -115,16 +189,13 @@ string DuckLakeTypes::ToString(const LogicalType &type) {
 		if (type.IsJSONType()) {
 			return "json";
 		}
-		if (type.id() == LogicalTypeId::UNBOUND) {
-			const auto type_name = type.GetAlias();
-			if (StringUtil::Lower(type_name) == "json") {
-				return "json";
-			}
-		}
 		throw InvalidInputException("Unsupported user-defined type");
 	}
 	switch (type.id()) {
 	case LogicalTypeId::STRUCT:
+		if (StructType::GetChildCount(type) == 0) {
+			throw InvalidInputException("Failed to convert DuckDB type to DuckLake - unsupported type %s", type);
+		}
 		return "struct";
 	case LogicalTypeId::VARIANT:
 		return "variant";
@@ -146,11 +217,23 @@ string DuckLakeTypes::ToString(const LogicalType &type) {
 	}
 }
 
-void DuckLakeTypes::CheckSupportedType(const LogicalType &type) {
-	TypeVisitor::VisitReplace(type, [](const LogicalType &type) {
+void DuckLakeTypes::CheckSupportedType(const LogicalType &type, DuckLakeVersion version) {
+	TypeVisitor::VisitReplace(type, [version](const LogicalType &type) {
+		if (type.id() == LogicalTypeId::SQLNULL && version < DuckLakeVersion::V1_1) {
+			ThrowUnsupportedByVersion(version, "the NULL type");
+		}
+		if (type.id() == LogicalTypeId::TIMESTAMP_TZ_NS && version < DuckLakeVersion::V1_1) {
+			ThrowUnsupportedByVersion(version, "the TIMESTAMPTZ_NS type");
+		}
 		DuckLakeTypes::ToString(type);
 		return type;
 	});
+}
+
+void DuckLakeTypes::CheckSupportedTypes(const ColumnList &columns, DuckLakeVersion version) {
+	for (auto &col : columns.Logical()) {
+		CheckSupportedType(col.Type(), version);
+	}
 }
 
 } // namespace duckdb

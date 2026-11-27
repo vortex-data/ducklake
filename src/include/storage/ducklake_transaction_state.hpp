@@ -1,0 +1,390 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// storage/ducklake_transaction_state.hpp
+//
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "storage/ducklake_stats.hpp"
+#include "storage/ducklake_transaction.hpp"
+
+namespace duckdb {
+struct DuckLakeAddedFields;
+class MacroCatalogEntry;
+
+struct DuckLakeColumnSchemaEntry {
+	FieldIndex field_index;
+	Identifier column_name;
+	LogicalType column_type;
+	//! False for nested struct, list, map and array leaves, only roots are merged from inlined data
+	//! It has no default initializer so the struct stays a C++11 aggregate, and every producer sets it
+	bool is_root;
+};
+
+struct DuckLakeCommitContext {
+	//! Runs a metadata-DB query during conflict resolution.
+	std::function<unique_ptr<QueryResult>(string)> conflict_query_executor;
+	//! The query of the latest snapshot, its table stats and the changes since the transaction snapshot
+	string snapshot_and_stats_query;
+	//! Whether the inlined file deletion table of a table exists, it is created lazily
+	std::function<bool(TableIndex)> inlined_file_deletion_table_exists;
+	//! Returns the latest snapshot for the first commit attempt.
+	std::function<DuckLakeSnapshot()> get_snapshot;
+	//! What the expiries of the transaction delete in the commit attempt, read after the latest snapshot
+	std::function<DuckLakeExpiry(idx_t, idx_t)> get_expired_snapshots = [](idx_t, idx_t) {
+		return DuckLakeExpiry();
+	};
+	//! Deletes the metadata that only the expired snapshots referenced, after the batch that deleted them
+	std::function<void(const vector<DuckLakeSnapshotInfo> &)> cleanup_expired_snapshots =
+	    [](const vector<DuckLakeSnapshotInfo> &) {
+	    };
+	//! Whether expiring snapshots is the only change of the transaction
+	bool only_expires_snapshots = false;
+	//! The commit snapshot can be older than the metadata it reads, so even the first attempt checks conflicts
+	bool check_conflicts_first = false;
+	//! Rewrites the delete files whose new deletes are not dated to the commit snapshot.
+	std::function<void(idx_t)> set_delete_commit_snapshot = [](idx_t) {
+	};
+	//! Executes the batched snapshot/changes SQL against the metadata DB.
+	std::function<unique_ptr<QueryResult>(DuckLakeSnapshot, string &)> execute_commit_batch;
+	//! Classifies metadata-catalog errors that are safe to retry.
+	std::function<bool(const string &)> is_retryable_metadata_error = [](const string &) {
+		return false;
+	};
+	//! Whether the catalog rejected the commit with the error: it rolled back, so nothing was published.
+	std::function<bool(const string &)> is_catalog_rejection = [](const string &) {
+		return false;
+	};
+	//! The commit error without the failed query text that it repeats.
+	std::function<string(const string &)> commit_error_without_query = [](const string &message) {
+		return message;
+	};
+	//! Advice for a commit error that is not retried.
+	std::function<string(const string &)> commit_error_hint = [](const string &) {
+		return string();
+	};
+	//! Optional hooks below default to a no-op/constant; callers override only the ones they need.
+	//! Clears the metadata manager cache if a clear was pending.
+	std::function<void()> flush_cache_if_pending = []() {
+	};
+	//! Commits the underlying metadata connection.
+	// LCOV_EXCL_START
+	std::function<void()> commit_connection = []() {
+	};
+	//! Tells the committer whether its changes are in the metadata, or may be, whatever fails after that.
+	std::function<void(DuckLakeCommitOutcome)> report_commit_outcome = [](DuckLakeCommitOutcome) {
+	};
+	//! Rolls back the metadata connection if a transaction is active.
+	std::function<void()> try_rollback = []() {
+	};
+	//! Resets per-attempt state before a retry.
+	std::function<void()> prepare_retry = []() {
+	};
+	//! Throws when a failed attempt of the transaction cannot be retried.
+	std::function<void()> verify_retry = []() {
+	};
+	//! Writes again what the transaction wrote to the metadata before its commit, in a retried attempt.
+	std::function<void()> rewrite_before_retry = []() {
+	};
+	//! Whether the failed attempt ends the commit, also when another attempt could succeed.
+	std::function<bool()> skip_retry = []() {
+		return false;
+	};
+	// LCOV_EXCL_STOP
+	//! Runs a metadata-DB query during post-commit cleanup.
+	std::function<unique_ptr<QueryResult>(string)> query_metadata;
+	//! The data path of a table the transaction snapshot sees, empty if the caller does not know it
+	std::function<string(TableIndex)> get_table_path = [](TableIndex) {
+		return string();
+	};
+	//! Runs cleanup statements that drop metadata tables atomically.
+	std::function<unique_ptr<QueryResult>(string)> execute_in_transaction;
+	//! Runs a snapshot-templated metadata-DB query (handles {SNAPSHOT_ID} substitution).
+	std::function<unique_ptr<QueryResult>(DuckLakeSnapshot, string)> query_metadata_with_snapshot;
+	//! Optional Appender fast-path.
+	std::function<bool(DuckLakeSnapshot &, const vector<DuckLakeFileInfo> &, const vector<DuckLakeTableInfo> &,
+	                   vector<DuckLakeSchemaInfo> &)>
+	    try_append_data_files = [](DuckLakeSnapshot &, const vector<DuckLakeFileInfo> &,
+	                               const vector<DuckLakeTableInfo> &, vector<DuckLakeSchemaInfo> &) {
+		    return false;
+	    };
+	//! Emits the SQL that registers new inlined data tables (CREATE TABLE + ducklake_inlined_data_tables INSERT).
+	// LCOV_EXCL_START
+	std::function<string(DuckLakeSnapshot, const vector<DuckLakeTableInfo> &, const set<TableIndex> &)>
+	    write_inlined_tables = [](DuckLakeSnapshot, const vector<DuckLakeTableInfo> &, const set<TableIndex> &) {
+		    return string();
+	    };
+	//! Emits the SQL that appends inlined data for the given table changes (handles new inlined-table creation,
+	//! per-tx cache, and the per-row INSERT VALUES).
+	std::function<string(DuckLakeSnapshot &, const vector<DuckLakeInlinedDataInfo> &, const vector<DuckLakeTableInfo> &,
+	                     const vector<DuckLakeTableInfo> &)>
+	    write_inlined_data;
+	//! Emits the SQL that creates+populates per-table inlined file-deletion tables (ducklake_inlined_delete_<id>)
+	//! and marks the metadata-manager cache for clearing when a new such table is created.
+	std::function<string(const vector<DuckLakeInlinedFileDeletionInfo> &)> write_inlined_file_deletes =
+	    [](const vector<DuckLakeInlinedFileDeletionInfo> &) {
+		    return string();
+	    };
+	//! Whether an earlier commit found values of a column at the snapshot
+	std::function<bool(TableIndex, FieldIndex, idx_t)> column_holds_values = [](TableIndex, FieldIndex, idx_t) {
+		return false;
+	};
+	std::function<void(TableIndex, FieldIndex, idx_t)> set_column_holds_values = [](TableIndex, FieldIndex, idx_t) {
+	};
+	//! Returns the current global table stats for a single table id (first-attempt path).
+	std::function<shared_ptr<DuckLakeTableStats>(TableIndex)> get_table_stats;
+	//! Top-level columns of a table at the commit snapshot — needed by stats-refresh to iterate
+	//! columns and look up types when merging per-file stats.
+	std::function<vector<DuckLakeColumnSchemaEntry>(TableIndex)> get_table_column_schema = [](TableIndex) {
+		return vector<DuckLakeColumnSchemaEntry> {};
+	};
+	// LCOV_EXCL_STOP
+	//! Reads an inlined data column as its type, for catalogs that store some types differently.
+	std::function<string(const string &, const LogicalType &)> cast_inlined_column = [](const string &column,
+	                                                                                    const LogicalType &) {
+		return column;
+	};
+	//! Names of the inlined-data tables associated with a table id at the commit snapshot.
+	// LCOV_EXCL_START
+	std::function<vector<Identifier>(TableIndex)> get_inlined_table_names = [](TableIndex) {
+		return vector<Identifier> {};
+	};
+	//! Net (delete-adjusted) row count of a table's regular data files.
+	std::function<idx_t(TableIndex)> get_net_data_file_row_count = [](TableIndex) {
+		return 0;
+	};
+	//! Builds a DuckLakeStats map from a vector of per-snapshot global stats (retry path).
+	std::function<unique_ptr<DuckLakeStats>(vector<DuckLakeGlobalStatsInfo> &)> build_stats_map;
+	//! Invalidates the cached schema in the catalog for a given schema version.
+	std::function<void(idx_t)> invalidate_schema_cache = [](idx_t) {
+	};
+	// LCOV_EXCL_STOP
+	//! Publishes the new schema version onto the transaction.
+	std::function<void(idx_t)> set_catalog_version;
+	//! Records the committed snapshot id on the catalog.
+	std::function<void(idx_t snapshot_id, idx_t next_catalog_id, idx_t next_file_id)> set_committed_snapshot_id;
+	//! Keeps the oids of the entries created by the commit on the catalog.
+	std::function<void(const ducklake_entry_oids_t &)> set_entry_oids = [](const ducklake_entry_oids_t &) {
+	};
+	//! Publishes the options of newly created tables onto the catalog.
+	std::function<void(const vector<DuckLakeConfigOption> &)> set_table_options =
+	    [](const vector<DuckLakeConfigOption> &) {
+	    };
+	//! Invalidates the cached stats entry for a table after a stats-affecting file drop.
+	std::function<void(idx_t, TableIndex)> invalidate_table_stats_cache = [](idx_t, TableIndex) {
+	};
+	//! Reports a failure after the metadata commit is already durable.
+	// LCOV_EXCL_START
+	std::function<void(const string &)> report_post_commit_error = [](const string &) {
+	};
+	// LCOV_EXCL_STOP
+	//! Whether the commit writes a snapshot, a commit that only changes options writes none.
+	bool write_snapshot = true;
+	//! Whether the commit batch locks the options of the transaction, also when it writes no snapshot.
+	bool locks_config_options = false;
+	//! Whether the commit batch publishes the changes itself, as the catalog commits each statement.
+	bool publishes_with_batch = false;
+	//! Author / message / extra info for the snapshot row.
+	DuckLakeSnapshotCommit commit_info;
+	//! When true, Commit() skips the post-commit DropEmptySupersededInlinedTables cleanup.
+	bool skip_drop_empty_inlined = false;
+	//! Whether the metadata schema has the >= 1.1 additions.
+	bool supports_v1_1_metadata = false;
+	//! Whether the snapshot tables are keyed by branch and snapshot, the layout of 2.0
+	bool supports_v2_0_metadata = false;
+	//! Whether the file tables keep their visibility as events, the layout of 2.0
+	bool supports_file_visibility_events = false;
+	//! Whether the catalog rows end in companion tables, the layout of 2.0
+	bool supports_row_visibility = false;
+	//! Whether a lookup on snapshot_id names the branch of main, where the metadata engine serves it from the key
+	bool branch_keyed_lookups = false;
+	//! Column names of the inlined data tables under this catalog version.
+	DuckLakeInlinedColNames InlinedColNames() const {
+		return DuckLakeInlinedColNames(supports_v1_1_metadata);
+	}
+};
+
+//! Holds the per-transaction mutable change state (new/dropped/renamed catalog entries, local file
+//! changes, flushed inlined tables) and owns the Commit() loop that flushes them into the metadata
+//! database. Owned by DuckLakeTransaction via a back-reference.
+class DuckLakeTransactionState {
+public:
+	DuckLakeTransactionState(DatabaseInstance &db, bool require_commit_message, DuckLakeNameMapSet &new_name_maps,
+	                         string data_path, string separator);
+	~DuckLakeTransactionState();
+
+	void Commit(DuckLakeSnapshot transaction_snapshot, const TransactionChangeInformation &transaction_changes,
+	            const DuckLakeRetryConfig &retry_config, const DuckLakeCommitContext &context);
+	//! Whether the error is of a metadata commit that is durable: DuckDB reports the checkpoint that fails after it
+	static bool IsDurableCommitError(const ErrorData &error);
+	//! Whether a commit that failed with the error may have been published anyway, as after a lost answer
+	static bool CommitMayHaveBeenPublished(const ErrorData &error);
+
+	SnapshotAndStats CheckForConflicts(DuckLakeSnapshot transaction_snapshot,
+	                                   const TransactionChangeInformation &changes,
+	                                   const DuckLakeCommitContext &context);
+	//! Replaces the error with a conflict with the commits of other transactions
+	bool FindConflictWithOtherCommits(DuckLakeSnapshot transaction_snapshot,
+	                                  const TransactionChangeInformation &changes, const DuckLakeCommitContext &context,
+	                                  ErrorData &error);
+	void CheckForConflicts(const TransactionChangeInformation &changes, const SnapshotChangeInformation &other_changes,
+	                       DuckLakeSnapshot transaction_snapshot, const DuckLakeCommitContext &context) const;
+	//! Fails when a snapshot tagged by this transaction was expired meanwhile
+	void CheckTaggedSnapshotsExist(const DuckLakeCommitContext &context) const;
+	//! The ids of the snapshots the tags point at, as a SQL list
+	static string TaggedSnapshotIdList(const case_insensitive_map_t<DuckLakeSnapshotTagInfo> &tags);
+	void CheckFileConflicts(const TransactionChangeInformation &changes, const SnapshotChangeInformation &other_changes,
+	                        const DuckLakeCommitContext &context) const;
+
+	static SnapshotDeletedFromFiles
+	GetFilesDeletedOrDroppedAfterSnapshot(const std::function<unique_ptr<QueryResult>(string)> &executor,
+	                                      bool file_events);
+
+	string WriteSnapshotChanges(DuckLakeCommitState &commit_state, TransactionChangeInformation &changes,
+	                            const DuckLakeCommitContext &context) const;
+
+	string CommitChanges(DuckLakeCommitState &commit_state, TransactionChangeInformation &transaction_changes,
+	                     optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats, const DuckLakeCommitContext &context,
+	                     map<TableIndex, DroppedDataFileStats> &attempt_dropped_file_stats);
+
+	vector<DuckLakeSchemaInfo> GetNewSchemas(DuckLakeCommitState &commit_state);
+	NewTableInfo GetNewTables(DuckLakeCommitState &commit_state, TransactionChangeInformation &transaction_changes);
+	void GetNewTableInfo(DuckLakeCommitState &commit_state, DuckLakeCatalogSet &catalog_set,
+	                     reference<CatalogEntry> table_entry, NewTableInfo &result,
+	                     TransactionChangeInformation &transaction_changes);
+	void GetNewViewInfo(DuckLakeCommitState &commit_state, DuckLakeCatalogSet &catalog_set,
+	                    reference<CatalogEntry> view_entry, NewTableInfo &result,
+	                    TransactionChangeInformation &transaction_changes);
+	NewMacroInfo GetNewMacros(DuckLakeCommitState &commit_state, TransactionChangeInformation &transaction_changes);
+	NewDataInfo GetNewDataFiles(string &batch_query, DuckLakeCommitState &commit_state,
+	                            optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats,
+	                            const DuckLakeCommitContext &context,
+	                            map<TableIndex, DroppedDataFileStats> &attempt_dropped_file_stats);
+	//! Removes the columns that the live data of the table may hold values of
+	void RemoveColumnsWithValues(TableIndex table_id, set<FieldIndex> &columns,
+	                             const DuckLakeCommitContext &context) const;
+	//! Lets new values set the unknown bounds of the columns whose live values are all NULL
+	void ResolveNullOnlyBounds(TableIndex table_id, const LocalTableDataChanges &table_changes,
+	                           DuckLakeTableStats &stats, idx_t snapshot_id,
+	                           const DuckLakeCommitContext &context) const;
+	//! Decrement table-level stats for files dropped this commit; returns true if live rows remain.
+	bool ApplyDroppedFileStats(TableIndex table_id, DuckLakeNewGlobalStats &new_stats,
+	                           map<TableIndex, DroppedDataFileStats> &attempt_dropped_file_stats);
+	//! Sets `recomputed_stats` when the column stats of a table were recomputed instead of cleared
+	string UpdateStatsForDroppedFiles(optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats,
+	                                  const DuckLakeCommitContext &context,
+	                                  map<TableIndex, DroppedDataFileStats> &attempt_dropped_file_stats,
+	                                  bool &recomputed_stats);
+	//! The committed statistics of a table with those of the fields this commit adds
+	void InitializeGlobalStats(TableIndex table_id, const DuckLakeTableStats &current_stats,
+	                           DuckLakeNewGlobalStats &new_globals) const;
+	//! Writes the statistics of the older rows for the fields this commit adds
+	string WriteAddedFieldStats(const vector<DuckLakeAddedFields> &added_fields,
+	                            optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats,
+	                            const DuckLakeCommitContext &context);
+	CompactionInformation GetCompactionChanges(DuckLakeCommitState &commit_state, CompactionType type);
+	//! After a REWRITE_DELETES compaction, recompute EXACT global stats for `table_id` from the post-rewrite file set
+	//! (+ committed inlined data) and append the UpdateGlobalTableStats SQL to `batch_query`. No-op (leaving the
+	//! existing stale stats, and the scan fallback) if the table is not fully delete-free post-rewrite or the
+	//! inlined data cannot be accounted for exactly. Returns whether it wrote the stats.
+	bool RecomputeGlobalStatsAfterRewrite(string &batch_query, TableIndex table_id, DuckLakeSnapshot snapshot,
+	                                      const CompactionInformation &rewrite_changes,
+	                                      const set<DataFileIndex> &removed_source_ids,
+	                                      const DuckLakeCommitContext &context, bool &deleted_rows_remain);
+	//! The recompute of RecomputeGlobalStatsAfterRewrite into `new_stats`, without writing it. `dropped_row_count`
+	//! live rows of files dropped by this commit are still part of the net row count of the table.
+	bool TryRecomputeGlobalStats(TableIndex table_id, DuckLakeSnapshot snapshot,
+	                             const CompactionInformation &rewrite_changes,
+	                             const set<DataFileIndex> &removed_source_ids, const DuckLakeCommitContext &context,
+	                             bool &deleted_rows_remain, idx_t dropped_row_count, DuckLakeTableStats &new_stats);
+	//! After dropping whole data files, recompute the EXACT global stats of `table_id` from the files that remain
+	//! instead of discarding its column stats. Returns false, leaving the stats to the caller, when the remaining
+	//! files are not delete-free.
+	bool TryRecomputeGlobalStatsAfterDrop(TableIndex table_id, idx_t dropped_row_count,
+	                                      const DuckLakeCommitContext &context, DuckLakeTableStats &result);
+	//! Merge committed inlined data's per-column min/max into `target` via typed SQL aggregates. Returns false if the
+	//! inlined data cannot be accounted for exactly (e.g. a non-scalar column), in which case the caller must not
+	//! claim the recomputed stats are exact.
+	bool TryMergeInlinedStats(TableIndex table_id, const vector<DuckLakeColumnSchemaEntry> &columns,
+	                          const vector<Identifier> &inlined_table_names, DuckLakeSnapshot snapshot,
+	                          DuckLakeTableStats &target, const DuckLakeCommitContext &context);
+	vector<DuckLakeDeleteFileInfo>
+	GetNewDeleteFiles(const DuckLakeCommitState &commit_state,
+	                  vector<DuckLakeOverwrittenDeleteFile> &overwritten_delete_files) const;
+	vector<DuckLakeDeletedInlinedDataInfo> GetNewInlinedDeletes(DuckLakeCommitState &commit_state) const;
+	vector<DuckLakeInlinedFileDeletionInfo> GetNewInlinedFileDeletes(DuckLakeCommitState &commit_state);
+	NewNameMapInfo GetNewNameMaps(DuckLakeCommitState &commit_state);
+	static DuckLakeFileInfo GetNewDataFile(const DuckLakeDataFile &file, DuckLakeCommitState &commit_state,
+	                                       TableIndex table_id, optional_idx row_id_start);
+
+	static void DropEmptySupersededInlinedTables(const DuckLakeCommitContext &context);
+	//! The definition of a macro, without its ids
+	static DuckLakeMacroInfo GetMacroInfo(const MacroCatalogEntry &macro_entry);
+
+	void CleanupFiles();
+
+	void EnsureCommitInfoProvided(const DuckLakeSnapshotCommit &commit_info) const;
+
+	bool SchemaChangesMade() const;
+	bool InlinedTableFlushed(const Identifier &table_name) const;
+
+public:
+	DatabaseInstance &db;
+	bool require_commit_message;
+	DuckLakeNameMapSet &new_name_maps;
+	string data_path;
+	string separator;
+	DuckLakeSnapshotCommit commit_info;
+	//! The files of the transaction belong to a client, which removes them itself if the commit fails
+	bool files_owned_by_client = false;
+
+	map<SchemaIndex, unique_ptr<DuckLakeCatalogSet>> new_tables;
+	set<TableIndex> dropped_tables;
+
+	map<SchemaIndex, unique_ptr<DuckLakeCatalogSet>> new_scalar_macros;
+	map<SchemaIndex, unique_ptr<DuckLakeCatalogSet>> new_table_macros;
+	set<MacroIndex> dropped_scalar_macros;
+	set<MacroIndex> dropped_table_macros;
+
+	set<TableIndex> renamed_tables;
+	set<TableIndex> renamed_views;
+	set<TableIndex> dropped_views;
+	unordered_map<string, DataFileIndex> dropped_files;
+	map<TableIndex, DroppedDataFileStats> dropped_file_stats;
+	set<TableIndex> tables_deleted_from;
+	set<TableIndex> tables_delete_attempted;
+	unique_ptr<DuckLakeCatalogSet> new_schemas;
+	map<SchemaIndex, reference<DuckLakeSchemaEntry>> dropped_schemas;
+	LocalTableChanges local_changes;
+	vector<FlushedInlinedTableInfo> flushed_inlined_tables;
+	//! The tables whose inlined file deletions were flushed, with the snapshot of the flush
+	map<TableIndex, idx_t> flushed_inlined_file_deletions;
+	vector<DuckLakeConfigOption> committed_table_options;
+	//! The statistics written for the fields that this commit adds to existing tables
+	map<TableIndex, map<FieldIndex, DuckLakeColumnStats>> added_field_stats;
+	//! The tables whose stored size this commit reads back from their live data files
+	set<TableIndex> refreshed_table_sizes;
+	//! The tables other transactions changed after the snapshot of a retried commit
+	set<TableIndex> tables_changed_by_others;
+	//! The snapshot tags this transaction creates, by name
+	case_insensitive_map_t<DuckLakeSnapshotTagInfo> new_snapshot_tags;
+	//! The committed snapshot tags this transaction drops, by their stored name
+	case_insensitive_map_t<DuckLakeSnapshotTagInfo> dropped_snapshot_tags;
+	//! The committed snapshot tags past their expiry time that an expiry in the statements of this transaction drops
+	case_insensitive_map_t<DuckLakeSnapshotTagInfo> expired_snapshot_tags;
+	//! The ids that the commit gave the tables and views the transaction created, by their transaction-local id
+	map<TableIndex, TableIndex> committed_tables;
+	//! The oids of the entries the commit created, by their committed id
+	ducklake_entry_oids_t committed_entry_oids;
+};
+
+//! The error of a commit that failed after it published its changes: an IO error, as for a lost response, so that
+//! the client does not remove the files of the transaction
+ErrorData ErrorAfterPublication(const ErrorData &error);
+//! The error of a commit that can be published: an IO error as well, so that its client keeps the files
+ErrorData ErrorOfUnknownPublication(const ErrorData &error);
+
+} // namespace duckdb

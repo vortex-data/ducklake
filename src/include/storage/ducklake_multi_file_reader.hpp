@@ -17,6 +17,23 @@ class DuckLakeMultiFileList;
 struct DuckLakeDeleteMap;
 class DuckLakeFieldData;
 
+struct DuckLakeMultiFileReaderGlobalState : public MultiFileReaderGlobalState {
+	DuckLakeMultiFileReaderGlobalState(const MultiFileList &file_list_p, optional_idx deletion_scan_snapshot_col_p,
+	                                   optional_idx deletion_scan_file_row_number_col_p)
+	    : MultiFileReaderGlobalState(deletion_scan_file_row_number_col_p.IsValid()
+	                                     ? vector<LogicalType> {LogicalType::BIGINT}
+	                                     : vector<LogicalType> {},
+	                                 file_list_p),
+	      deletion_scan_snapshot_col(deletion_scan_snapshot_col_p),
+	      deletion_scan_file_row_number_col(deletion_scan_file_row_number_col_p) {
+	}
+
+	//! Output position of the snapshot_id of a deletion scan in global_column_ids order
+	const optional_idx deletion_scan_snapshot_col;
+	//! Position of the appended file_row_number expression, which looks up the snapshot of each deleted row
+	const optional_idx deletion_scan_file_row_number_col;
+};
+
 struct DuckLakeMultiFileReader : public MultiFileReader {
 public:
 	static constexpr column_t COLUMN_IDENTIFIER_SNAPSHOT_ID = UINT64_C(10000000000000000000);
@@ -29,19 +46,25 @@ public:
 	shared_ptr<DuckLakeDeleteMap> delete_map;
 
 public:
-	static unique_ptr<MultiFileReader> CreateInstance(const TableFunction &table_function);
+	static unique_ptr<MultiFileReader> CreateInstance(const BoundTableFunction &table_function);
 	//! Return a DuckLakeMultiFileList
 	shared_ptr<MultiFileList> CreateFileList(ClientContext &context, const vector<string> &paths,
 	                                         const FileGlobInput &options) override;
 
 	//! Override the regular parquet bind using the MultiFileReader Bind. The bind from these are what DuckDB's file
 	//! readers will try read
-	bool Bind(MultiFileOptions &options, MultiFileList &files, vector<LogicalType> &return_types, vector<string> &names,
-	          MultiFileReaderBindData &bind_data) override;
+	bool Bind(MultiFileOptions &options, MultiFileList &files, vector<LogicalType> &return_types,
+	          vector<Identifier> &names, MultiFileReaderBindData &bind_data) override;
 
 	//! Override the Options bind
 	void BindOptions(MultiFileOptions &options, MultiFileList &files, vector<LogicalType> &return_types,
-	                 vector<string> &names, MultiFileReaderBindData &bind_data) override;
+	                 vector<Identifier> &names, MultiFileReaderBindData &bind_data) override;
+
+	unique_ptr<MultiFileReaderGlobalState>
+	InitializeGlobalState(ClientContext &context, const MultiFileOptions &file_options,
+	                      const MultiFileReaderBindData &bind_data, const MultiFileList &file_list,
+	                      const vector<MultiFileColumnDefinition> &global_columns,
+	                      const vector<ColumnIndex> &global_column_ids) override;
 
 	ReaderInitializeType InitializeReader(MultiFileReaderData &reader_data, const MultiFileBindData &bind_data,
 	                                      const vector<MultiFileColumnDefinition> &global_columns,
@@ -56,6 +79,12 @@ public:
 	                                        BaseFileReaderOptions &options, const MultiFileOptions &file_options,
 	                                        MultiFileReaderInterface &interface) override;
 
+	ReaderInitializeType CreateMappingWithGlobalState(
+	    ClientContext &context, MultiFileReaderData &reader_data,
+	    const vector<MultiFileColumnDefinition> &global_columns, const vector<ColumnIndex> &global_column_ids,
+	    optional_ptr<TableFilterSet> filters, MultiFileList &multi_file_list, const MultiFileReaderBindData &bind_data,
+	    const virtual_column_map_t &virtual_columns, const DuckLakeMultiFileReaderGlobalState &global_state);
+
 	ReaderInitializeType CreateMapping(ClientContext &context, MultiFileReaderData &reader_data,
 	                                   const vector<MultiFileColumnDefinition> &global_columns,
 	                                   const vector<ColumnIndex> &global_column_ids,
@@ -63,11 +92,10 @@ public:
 	                                   const MultiFileReaderBindData &bind_data,
 	                                   const virtual_column_map_t &virtual_columns) override;
 
-	unique_ptr<Expression>
+	MultiFileReaderVirtualColumnBinding
 	GetVirtualColumnExpression(ClientContext &context, MultiFileReaderData &reader_data,
-	                           const vector<MultiFileColumnDefinition> &local_columns, idx_t &column_id,
-	                           const LogicalType &type, MultiFileLocalIndex local_index,
-	                           optional_ptr<MultiFileColumnDefinition> &global_column_reference) override;
+	                           const vector<MultiFileColumnDefinition> &local_columns, const idx_t column_id,
+	                           const LogicalType &type, MultiFileLocalIndex local_index) override;
 
 	unique_ptr<MultiFileReader> Copy() const override;
 
@@ -77,27 +105,23 @@ public:
 
 	static vector<MultiFileColumnDefinition> ColumnsFromFieldData(const DuckLakeFieldData &field_data,
 	                                                              bool emit_key_value = false);
+	//! The columns an inlined data reader reads from a committed inlined table, false if its schema is gone
+	static bool GetInlinedTableColumns(DuckLakeFunctionInfo &read_info, optional_idx schema_version,
+	                                   vector<MultiFileColumnDefinition> &columns);
 
 private:
 	shared_ptr<BaseFileReader> TryCreateInlinedDataReader(const OpenFileInfo &file);
 	//! Create a non-parquet format reader based on the file's file_format extended option (else nullptr).
 	shared_ptr<BaseFileReader> TryCreateFormatReader(ClientContext &context, const OpenFileInfo &file);
-	//! For deletion scans we need to get the snapshot_id values using per-row snapshot information
-	void GatherDeletionScanSnapshots(BaseFileReader &reader, const MultiFileReaderData &reader_data, DataChunk &chunk,
-	                                 optional_idx rowid_col_override = optional_idx()) const;
+	//! Gather per-row snapshot_id values using the file positions of the scanned rows
+	void GatherDeletionScanSnapshots(BaseFileReader &reader, const Vector &file_row_numbers, Vector &snapshot_vector,
+	                                 idx_t count) const;
 
 private:
 	unique_ptr<MultiFileColumnDefinition> row_id_column;
 	unique_ptr<MultiFileColumnDefinition> snapshot_id_column;
 	//! Inlined transaction-local data
 	shared_ptr<DuckLakeInlinedData> transaction_local_data;
-	//! For deletion scans: track which output column is snapshot_id (if any)
-	optional_idx deletion_scan_snapshot_col;
-	//! For deletion scans: track which output column is rowid (if any)
-	optional_idx deletion_scan_rowid_col;
-	//! Whether row_id was internally projected (not in user's query)
-	//! This is necessary for DCF queries over inlined deletions
-	bool internally_projected_rowid = false;
 };
 
 } // namespace duckdb

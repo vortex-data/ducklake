@@ -6,6 +6,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/table_filter_state.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -22,8 +23,8 @@ TableFunction DuckLakeFormatReader::GetReadFunction(ClientContext &context, cons
 	auto &instance = DatabaseInstance::GetDatabase(context);
 	ExtensionHelper::TryAutoLoadExtension(instance, format);
 	ExtensionLoader loader(instance, "ducklake");
-	auto &scan_entry = loader.GetTableFunction("read_" + format);
-	return scan_entry.functions.functions[0];
+	auto &scan_entry = loader.GetTableFunction(Identifier("read_" + format));
+	return *scan_entry.functions.functions[0];
 }
 
 bool DuckLakeFormatReader::TryInitializeScan(ClientContext &context, GlobalTableFunctionState &gstate,
@@ -41,19 +42,18 @@ bool DuckLakeFormatReader::TryInitializeScan(ClientContext &context, GlobalTable
 
 	vector<Value> children;
 	children.push_back(Value(file.path));
-	named_parameter_map_t named_params;
+	named_argument_map_t named_params;
 	vector<LogicalType> input_types;
-	vector<string> input_names;
+	vector<Identifier> input_names;
 	if (StringUtil::CIEquals(format, "json")) {
 		// read_json only auto-detects when asked; the SQL wrapper does this for us
-		named_params["auto_detect"] = Value::BOOLEAN(true);
+		named_params[Identifier("auto_detect")] = Value::BOOLEAN(true);
 	}
 
 	TableFunctionRef empty;
-	TableFunction dummy_table_function;
-	dummy_table_function.name = "DuckLakeFormatReader";
-	TableFunctionBindInput bind_input(children, named_params, input_types, input_names, nullptr, nullptr,
-	                                  dummy_table_function, empty);
+	BoundTableFunction bound_table_function(file_scan);
+	TableFunctionBindInput bind_input(children, named_params, input_types, input_names, file_scan.function_info.get(),
+	                                  nullptr, bound_table_function, empty);
 	bind_data = file_scan.bind(context, bind_input, file_types, file_names);
 
 	// map each projected column onto a file column (by name), the ordinal, or NULL if absent
@@ -69,7 +69,7 @@ bool DuckLakeFormatReader::TryInitializeScan(ClientContext &context, GlobalTable
 		}
 		optional_idx file_position;
 		for (idx_t i = 0; i < file_names.size(); i++) {
-			if (StringUtil::CIEquals(file_names[i], col.name)) {
+			if (StringUtil::CIEquals(file_names[i].GetIdentifierName(), col.name.GetIdentifierName())) {
 				file_position = i;
 				break;
 			}
@@ -91,11 +91,38 @@ bool DuckLakeFormatReader::TryInitializeScan(ClientContext &context, GlobalTable
 	}
 	scan_chunk.Initialize(context, scan_types);
 
+	for (auto &entry : expression_map) {
+		auto &column_index = column_indexes[entry.first];
+		auto column_id = column_index.GetPrimaryIndex();
+		auto &expression_data = entry.second;
+		auto &expression = *expression_data.expression;
+		expression_executors[column_id] = make_uniq<ExpressionExecutor>(context, expression);
+	}
+
 	thread_context = make_uniq<ThreadContext>(context);
 	execution_context = make_uniq<ExecutionContext>(context, *thread_context, nullptr);
 	TableFunctionInitInput init_input(bind_data.get(), scan_column_ids, vector<idx_t>(), nullptr);
 	global_state = file_scan.init_global(context, init_input);
 	local_state = file_scan.init_local(*execution_context, init_input, global_state.get());
+	return true;
+}
+
+bool DuckLakeFormatReader::TryEvaluateExpression(ClientContext &context, idx_t virtual_col_idx, Vector &input_vector,
+                                                 const LogicalType &input_type, idx_t count, Vector &output_vector) {
+	if (expression_map.empty() || virtual_col_idx >= column_ids.size()) {
+		return false;
+	}
+	auto local_id = column_ids[MultiFileLocalIndex(virtual_col_idx)];
+	auto expr_it = expression_executors.find(local_id);
+	if (expr_it == expression_executors.end()) {
+		return false;
+	}
+	DataChunk expr_input;
+	expr_input.Initialize(Allocator::Get(context), {input_type});
+	expr_input.Reset();
+	expr_input.data[0].Reference(input_vector);
+	expr_input.SetChildCardinality(count);
+	expr_it->second->ExecuteExpression(expr_input, output_vector);
 	return true;
 }
 
@@ -113,6 +140,9 @@ AsyncResult DuckLakeFormatReader::Scan(ClientContext &context, GlobalTableFuncti
 		switch (output_kinds[c]) {
 		case FormatReaderColumn::FILE_COLUMN: {
 			auto &source = scan_chunk.data[output_source_index[c]];
+			if (TryEvaluateExpression(context, c, source, source.GetType(), scan_count, chunk.data[c])) {
+				break;
+			}
 			if (chunk.data[c].GetType() != source.GetType()) {
 				VectorOperations::Cast(context, source, chunk.data[c], scan_count);
 			} else {
@@ -121,10 +151,12 @@ AsyncResult DuckLakeFormatReader::Scan(ClientContext &context, GlobalTableFuncti
 			break;
 		}
 		case FormatReaderColumn::ORDINAL: {
-			auto ordinal_data = FlatVector::GetData<int64_t>(chunk.data[c]);
-			for (idx_t r = 0; r < scan_count; r++) {
-				ordinal_data[r] = file_row_number + NumericCast<int64_t>(r);
+			Vector ordinal_vector(LogicalType::BIGINT);
+			VectorOperations::GenerateSequence(ordinal_vector, scan_count, file_row_number);
+			if (TryEvaluateExpression(context, c, ordinal_vector, LogicalType::BIGINT, scan_count, chunk.data[c])) {
+				break;
 			}
+			VectorOperations::Copy(ordinal_vector, chunk.data[c], scan_count, 0, 0);
 			break;
 		}
 		case FormatReaderColumn::MISSING:
@@ -133,7 +165,7 @@ AsyncResult DuckLakeFormatReader::Scan(ClientContext &context, GlobalTableFuncti
 			break;
 		}
 	}
-	chunk.SetCardinality(scan_count);
+	chunk.SetChildCardinality(scan_count);
 
 	if (filters || deletion_filter) {
 		SelectionVector sel;
@@ -142,16 +174,14 @@ AsyncResult DuckLakeFormatReader::Scan(ClientContext &context, GlobalTableFuncti
 			approved_tuple_count = deletion_filter->Filter(file_row_number, approved_tuple_count, sel);
 		}
 		if (filters) {
-			for (auto &entry : filters->filters) {
-				if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) {
+			for (auto &entry : *filters) {
+				auto &filter = entry.Filter();
+				if (ExpressionFilter::IsRootOptionalFilter(filter)) {
 					continue;
 				}
-				auto &vec = chunk.data[entry.first];
-				UnifiedVectorFormat vdata;
-				vec.ToUnifiedFormat(chunk.size(), vdata);
-				auto &filter = *entry.second;
+				auto column_id = entry.GetIndex().GetIndex();
 				auto filter_state = TableFilterState::Initialize(context, filter);
-				approved_tuple_count = ColumnSegment::FilterSelection(sel, vec, vdata, filter, *filter_state,
+				approved_tuple_count = ColumnSegment::FilterSelection(sel, chunk.data[column_id], *filter_state,
 				                                                      chunk.size(), approved_tuple_count);
 			}
 		}

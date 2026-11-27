@@ -41,7 +41,7 @@ INSERT INTO ducklake.t VALUES (4, 'd', 4.5, [4])
 # the writes really committed as vortex data files (this is empty if the transactions rolled back)
 query II
 SELECT file_format, SUM(record_count)
-FROM ducklake_meta.ducklake_data_file WHERE end_snapshot IS NULL GROUP BY file_format
+FROM ducklake_meta.ducklake_data_file GROUP BY file_format
 ----
 vortex	4
 

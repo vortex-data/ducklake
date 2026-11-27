@@ -1,103 +1,105 @@
 #include "functions/ducklake_table_functions.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "common/ducklake_util.hpp"
 #include "storage/ducklake_transaction_changes.hpp"
-#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_scan.hpp"
+#include "storage/ducklake_multi_file_reader.hpp"
+#include "duckdb/main/query_result.hpp"
 #include "duckdb/planner/tableref/bound_at_clause.hpp"
 
 namespace duckdb {
 
-string GetTableName(const Value &input) {
-	if (input.IsNull()) {
-		throw BinderException("Table cannot be NULL");
-	}
-	return input.GetValue<string>();
-}
+static unique_ptr<FunctionData> DuckLakeTableChangesBind(ClientContext &context, TableFunctionBindInput &input,
+                                                         vector<LogicalType> &return_types, vector<Identifier> &names,
+                                                         DuckLakeScanType scan_type) {
+	auto start_at_clause = DuckLakeTableFunctionUtil::AtClauseFromValue(input.inputs[3]);
+	auto end_at_clause = DuckLakeTableFunctionUtil::AtClauseFromValue(input.inputs[4]);
 
-TableCatalogEntry &GetTableEntry(ClientContext &context, Catalog &catalog, const EntryLookupInfo &lookup,
-                                 const Value &schema) {
-	if (schema.IsNull()) {
+	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input);
+	auto &transaction = DuckLakeTransaction::Get(context, catalog);
+	auto table_name = DuckLakeTableFunctionUtil::GetTableName(input.inputs[2]);
+	// the end of a change feed is the newest snapshot at or before its timestamp, also before expired snapshots
+	auto end_snapshot = transaction.GetSnapshot(end_at_clause, SnapshotBound::UPPER_BOUND);
+	BoundAtClause end_version_clause("version", Value::BIGINT(NumericCast<int64_t>(end_snapshot.snapshot_id)));
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, QualifiedName(Identifier(table_name)), end_version_clause,
+	                       QueryErrorContext());
+	if (input.inputs[1].IsNull()) {
 		throw BinderException("Schema cannot be NULL");
 	}
-	auto schema_name = schema.GetValue<string>();
-	auto entry = catalog.GetEntry(context, schema_name, lookup, OnEntryNotFound::THROW_EXCEPTION);
-	return entry->Cast<TableCatalogEntry>();
-}
-
-BoundAtClause AtClauseFromValue(const Value &input) {
-	if (input.IsNull()) {
-		throw BinderException("Snapshot identifier cannot be NULL");
-	}
-	switch (input.type().id()) {
-	case LogicalTypeId::BIGINT:
-		return BoundAtClause("version", input);
-	case LogicalTypeId::TIMESTAMP_TZ:
-		return BoundAtClause("timestamp", input);
-	default:
-		throw InternalException("Unsupported type for At Clause");
-	}
-}
-
-static unique_ptr<FunctionData> DuckLakeTableChangesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                         vector<LogicalType> &return_types, vector<string> &names,
-                                                         DuckLakeScanType scan_type) {
-	auto start_at_clause = AtClauseFromValue(input.inputs[3]);
-	auto end_at_clause = AtClauseFromValue(input.inputs[4]);
-
-	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input.inputs[0]);
-	auto table_name = GetTableName(input.inputs[2]);
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, table_name, end_at_clause, QueryErrorContext());
-	auto &table = GetTableEntry(context, catalog, lookup, input.inputs[1]);
-	auto &transaction = DuckLakeTransaction::Get(context, catalog);
+	auto &table =
+	    DuckLakeBaseMetadataFunction::GetTableEntry(context, catalog, input.inputs[1].GetValue<string>(), lookup,
+	                                                "Data change feed functions only support tables.");
 
 	unique_ptr<FunctionData> bind_data;
-	input.table_function = table.GetScanFunction(context, bind_data, lookup);
+	input.table_function = BoundTableFunction(table.GetScanFunction(context, bind_data, lookup));
 
 	auto &function_info = input.table_function.function_info->Cast<DuckLakeFunctionInfo>();
-	names = function_info.column_names;
+	// a column of the table named like the snapshot id or row id of the changes would hide them
+	auto virtual_columns = table.GetVirtualColumns();
+	vector<Identifier> output_names {virtual_columns.at(DuckLakeMultiFileReader::COLUMN_IDENTIFIER_SNAPSHOT_ID).name,
+	                                 virtual_columns.at(COLUMN_IDENTIFIER_ROW_ID).name};
+	for (const auto &column_name : function_info.column_names) {
+		output_names.emplace_back(column_name);
+	}
+	QueryResult::DeduplicateColumns(output_names);
+	names.assign(output_names.begin() + 2, output_names.end());
 	return_types = function_info.column_types;
 	function_info.start_snapshot =
 	    make_uniq<DuckLakeSnapshot>(transaction.GetSnapshot(start_at_clause, SnapshotBound::LOWER_BOUND));
 	function_info.scan_type = scan_type;
+	if (scan_type == DuckLakeScanType::SCAN_DELETIONS) {
+		// Per-row deletion snapshots are populated after the file reader applies pushed filters.
+		input.table_function.filter_pushdown = false;
+	}
 	return bind_data;
 }
 
 static unique_ptr<FunctionData> DuckLakeTableInsertionsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                                            vector<LogicalType> &return_types,
+                                                            vector<Identifier> &names) {
 	return DuckLakeTableChangesBind(context, input, return_types, names, DuckLakeScanType::SCAN_INSERTIONS);
 }
 
 static unique_ptr<FunctionData> DuckLakeTableDeletionsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                           vector<LogicalType> &return_types, vector<string> &names) {
+                                                           vector<LogicalType> &return_types,
+                                                           vector<Identifier> &names) {
 	return DuckLakeTableChangesBind(context, input, return_types, names, DuckLakeScanType::SCAN_DELETIONS);
 }
 
-static unique_ptr<GlobalTableFunctionState> DuckLakeChangesInit(ClientContext &context, TableFunctionInitInput &input) {
-	throw InternalException("DuckLakeChangesInit should never be called");
-}
-
+// LCOV_EXCL_START
 static void DuckLakeChangesExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	// LCOV_EXCL_STOP
 	throw InternalException("DuckLakeChangesExecute should never be called");
 }
 
-TableFunctionSet DuckLakeTableInsertionsFunction::GetFunctions() {
-	TableFunctionSet set("ducklake_table_insertions");
-	vector<LogicalType> at_types {LogicalType::BIGINT, LogicalType::TIMESTAMP_TZ};
-	for (auto &type : at_types) {
-		set.AddFunction(TableFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, type, type},
-		                              DuckLakeChangesExecute, DuckLakeTableInsertionsBind, DuckLakeChangesInit));
+static TableFunctionSet GetChangesFunctions(const char *name, table_function_bind_t bind) {
+	TableFunctionSet set(name);
+	// a tag mixes only with a snapshot id, so a quoted timestamp next to a timestamp stays a timestamp
+	vector<pair<LogicalType, LogicalType>> bound_types {{LogicalType::BIGINT, LogicalType::BIGINT},
+	                                                    {LogicalType::TIMESTAMP_TZ, LogicalType::TIMESTAMP_TZ},
+	                                                    {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                                    {LogicalType::BIGINT, LogicalType::VARCHAR},
+	                                                    {LogicalType::VARCHAR, LogicalType::BIGINT}};
+	for (auto &types : bound_types) {
+		set.AddFunction(TableFunction(FunctionSignature()
+		                                  .AddPositionalOnly("catalog", LogicalType::VARCHAR)
+		                                  .AddPositionalOnly("schema_name", LogicalType::VARCHAR)
+		                                  .AddPositionalOnly("table_name", LogicalType::VARCHAR)
+		                                  .AddPositionalOnly("start_snapshot", types.first)
+		                                  .AddPositionalOnly("end_snapshot", types.second),
+		                              DuckLakeChangesExecute, bind));
 	}
 	return set;
 }
 
+TableFunctionSet DuckLakeTableInsertionsFunction::GetFunctions() {
+	return GetChangesFunctions("ducklake_table_insertions", DuckLakeTableInsertionsBind);
+}
+
 TableFunctionSet DuckLakeTableDeletionsFunction::GetFunctions() {
-	TableFunctionSet set("ducklake_table_deletions");
-	vector<LogicalType> at_types {LogicalType::BIGINT, LogicalType::TIMESTAMP_TZ};
-	for (auto &type : at_types) {
-		set.AddFunction(TableFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, type, type},
-		                              DuckLakeChangesExecute, DuckLakeTableDeletionsBind, DuckLakeChangesInit));
-	}
-	return set;
+	return GetChangesFunctions("ducklake_table_deletions", DuckLakeTableDeletionsBind);
 }
 } // namespace duckdb

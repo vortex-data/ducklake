@@ -10,6 +10,8 @@
 
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "duckdb/common/table_index.hpp"
+#include "duckdb/common/typed_index.hpp"
 
 namespace duckdb {
 
@@ -22,148 +24,43 @@ struct DuckLakeConstants {
 	}
 };
 
-struct SchemaIndex {
-	SchemaIndex() : index(DConstants::INVALID_INDEX) {
-	}
-	explicit SchemaIndex(idx_t index) : index(index) {
-	}
+struct SchemaIndex : public TypedIndex<SchemaIndex> {
+	using TypedIndex::TypedIndex;
 
-	idx_t index;
-
-	inline bool operator==(const SchemaIndex &rhs) const {
-		return index == rhs.index;
-	};
-	inline bool operator!=(const SchemaIndex &rhs) const {
-		return index != rhs.index;
-	};
-	inline bool operator<(const SchemaIndex &rhs) const {
-		return index < rhs.index;
-	};
-	bool IsValid() const {
-		return index != DConstants::INVALID_INDEX;
-	}
 	bool IsTransactionLocal() const {
 		D_ASSERT(IsValid());
 		return index >= DuckLakeConstants::TRANSACTION_LOCAL_ID_START;
 	}
 };
 
-struct TableIndex {
-	TableIndex() : index(DConstants::INVALID_INDEX) {
-	}
-	explicit TableIndex(idx_t index) : index(index) {
-	}
+inline bool IsTransactionLocal(const TableIndex &idx) {
+	D_ASSERT(idx.IsValid());
+	return idx.index >= DuckLakeConstants::TRANSACTION_LOCAL_ID_START;
+}
 
-	idx_t index;
-
-	inline bool operator==(const TableIndex &rhs) const {
-		return index == rhs.index;
-	};
-	inline bool operator!=(const TableIndex &rhs) const {
-		return index != rhs.index;
-	};
-	inline bool operator<(const TableIndex &rhs) const {
-		return index < rhs.index;
-	};
-	bool IsValid() const {
-		return index != DConstants::INVALID_INDEX;
-	}
-	bool IsTransactionLocal() const {
-		D_ASSERT(IsValid());
-		return index >= DuckLakeConstants::TRANSACTION_LOCAL_ID_START;
-	}
+struct MacroIndex : public TypedIndex<MacroIndex> {
+	using TypedIndex::TypedIndex;
 };
 
-struct MacroIndex {
-	MacroIndex() : index(DConstants::INVALID_INDEX) {
-	}
-	explicit MacroIndex(idx_t index) : index(index) {
-	}
-
-	idx_t index;
-
-	inline bool operator==(const MacroIndex &rhs) const {
-		return index == rhs.index;
-	};
-	inline bool operator!=(const MacroIndex &rhs) const {
-		return index != rhs.index;
-	};
-	inline bool operator<(const MacroIndex &rhs) const {
-		return index < rhs.index;
-	};
-	bool IsValid() const {
-		return index != DConstants::INVALID_INDEX;
-	}
-	bool IsTransactionLocal() const {
-		D_ASSERT(IsValid());
-		return index >= DuckLakeConstants::TRANSACTION_LOCAL_ID_START;
-	}
+struct FieldIndex : public TypedIndex<FieldIndex> {
+	using TypedIndex::TypedIndex;
 };
 
-struct FieldIndex {
-	FieldIndex() : index(DConstants::INVALID_INDEX) {
-	}
-	explicit FieldIndex(idx_t index) : index(index) {
+//! A column that a scan reads, with the fields of a struct that it reads: all fields if there are none
+struct DuckLakeProjectedColumn {
+	explicit DuckLakeProjectedColumn(FieldIndex field_index_p) : field_index(field_index_p) {
 	}
 
-	idx_t index;
-
-	inline bool operator==(const FieldIndex &rhs) const {
-		return index == rhs.index;
-	};
-	inline bool operator!=(const FieldIndex &rhs) const {
-		return index != rhs.index;
-	};
-	inline bool operator<(const FieldIndex &rhs) const {
-		return index < rhs.index;
-	};
-	bool IsValid() const {
-		return index != DConstants::INVALID_INDEX;
-	}
+	FieldIndex field_index;
+	vector<DuckLakeProjectedColumn> children;
 };
 
-struct DataFileIndex {
-	DataFileIndex() : index(DConstants::INVALID_INDEX) {
-	}
-	explicit DataFileIndex(idx_t index) : index(index) {
-	}
-
-	idx_t index;
-
-	inline bool operator==(const DataFileIndex &rhs) const {
-		return index == rhs.index;
-	};
-	inline bool operator!=(const DataFileIndex &rhs) const {
-		return index != rhs.index;
-	};
-	inline bool operator<(const DataFileIndex &rhs) const {
-		return index < rhs.index;
-	};
-	bool IsValid() const {
-		return index != DConstants::INVALID_INDEX;
-	}
+struct DataFileIndex : public TypedIndex<DataFileIndex> {
+	using TypedIndex::TypedIndex;
 };
 
-struct MappingIndex {
-	MappingIndex() : index(DConstants::INVALID_INDEX) {
-	}
-	explicit MappingIndex(idx_t index) : index(index) {
-	}
-
-	idx_t index;
-
-	inline bool operator==(const MappingIndex &rhs) const {
-		return index == rhs.index;
-	};
-	inline bool operator!=(const MappingIndex &rhs) const {
-		return index != rhs.index;
-	};
-	inline bool operator<(const MappingIndex &rhs) const {
-		return index < rhs.index;
-	};
-	bool IsValid() const {
-		return index != DConstants::INVALID_INDEX;
-	}
+struct MappingIndex : public TypedIndex<MappingIndex> {
+	using TypedIndex::TypedIndex;
 };
 
 } // namespace duckdb

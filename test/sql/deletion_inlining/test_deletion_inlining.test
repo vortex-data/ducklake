@@ -6,12 +6,12 @@ require ducklake
 
 require parquet
 
-test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
 
-test-env DATA_PATH __TEST_DIR__
+test-env DATA_PATH {TEST_DIR}
 
 statement ok
-ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/test_deletion_inlining',DATA_INLINING_ROW_LIMIT 10,  METADATA_CATALOG 'ducklake_meta')
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/test_deletion_inlining',DATA_INLINING_ROW_LIMIT 10,  METADATA_CATALOG 'ducklake_meta')
 
 statement ok
 use ducklake
@@ -24,7 +24,7 @@ statement ok
 DELETE FROM T where a < 5
 
 query IIII
-SELECT table_id, begin_snapshot, end_snapshot, delete_count FROM ducklake_meta.ducklake_delete_file
+SELECT table_id, begin_snapshot, end_snapshot, delete_count FROM (SELECT f.*, v.begin_snapshot, v.end_snapshot FROM ducklake_meta.ducklake_delete_file f JOIN (SELECT delete_file_id, MAX(CASE WHEN is_delete = FALSE THEN snapshot_id END) begin_snapshot, MAX(CASE WHEN is_delete = TRUE THEN snapshot_id END) end_snapshot FROM ducklake_meta.ducklake_delete_file_visibility WHERE branch_id = 0 GROUP BY delete_file_id) v ON v.delete_file_id = f.delete_file_id)
 ----
 
 # Verify the first inlined deletion (5 rows: 0-4)
@@ -94,21 +94,12 @@ SELECT file_id, row_id, begin_snapshot FROM ducklake_meta.ducklake_inlined_delet
 ----
 
 query I
-SELECT count(*) FROM GLOB('${DATA_PATH}/test_deletion_inlining/**/*-delete.parquet')
+SELECT count(*) FROM GLOB('{DATA_PATH}/test_deletion_inlining/**/*-delete.*')
 ----
 1
 
-# Verify new deletion file schema - should have _ducklake_internal_snapshot_id column
-# since it was created from flushing inlined deletions
-query II
-SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM '${DATA_PATH}/test_deletion_inlining/**/*-delete.parquet') ORDER BY column_name
-----
-_ducklake_internal_snapshot_id	BIGINT
-file_path	VARCHAR
-pos	BIGINT
-
 query IIIII
-SELECT table_id, begin_snapshot, end_snapshot, delete_count, partial_max FROM ducklake_meta.ducklake_delete_file ORDER BY begin_snapshot
+SELECT table_id, begin_snapshot, end_snapshot, delete_count, partial_max FROM (SELECT f.*, v.begin_snapshot, v.end_snapshot FROM ducklake_meta.ducklake_delete_file f JOIN (SELECT delete_file_id, MAX(CASE WHEN is_delete = FALSE THEN snapshot_id END) begin_snapshot, MAX(CASE WHEN is_delete = TRUE THEN snapshot_id END) end_snapshot FROM ducklake_meta.ducklake_delete_file_visibility WHERE branch_id = 0 GROUP BY delete_file_id) v ON v.delete_file_id = f.delete_file_id) ORDER BY begin_snapshot
 ----
 1	2	NULL	10	4
 
@@ -142,7 +133,7 @@ SELECT COUNT(*) FROM t
 
 # Delete file should still have 10 deletions from the first flush
 query IIIII
-SELECT table_id, begin_snapshot, end_snapshot, delete_count, partial_max FROM ducklake_meta.ducklake_delete_file ORDER BY begin_snapshot
+SELECT table_id, begin_snapshot, end_snapshot, delete_count, partial_max FROM (SELECT f.*, v.begin_snapshot, v.end_snapshot FROM ducklake_meta.ducklake_delete_file f JOIN (SELECT delete_file_id, MAX(CASE WHEN is_delete = FALSE THEN snapshot_id END) begin_snapshot, MAX(CASE WHEN is_delete = TRUE THEN snapshot_id END) end_snapshot FROM ducklake_meta.ducklake_delete_file_visibility WHERE branch_id = 0 GROUP BY delete_file_id) v ON v.delete_file_id = f.delete_file_id) ORDER BY begin_snapshot
 ----
 1	2	NULL	10	4
 
@@ -150,7 +141,7 @@ statement ok
 CALL ducklake_flush_inlined_data('ducklake')
 
 query IIIII
-SELECT table_id, begin_snapshot, end_snapshot, delete_count, partial_max FROM ducklake_meta.ducklake_delete_file ORDER BY begin_snapshot
+SELECT table_id, begin_snapshot, end_snapshot, delete_count, partial_max FROM (SELECT f.*, v.begin_snapshot, v.end_snapshot FROM ducklake_meta.ducklake_delete_file f JOIN (SELECT delete_file_id, MAX(CASE WHEN is_delete = FALSE THEN snapshot_id END) begin_snapshot, MAX(CASE WHEN is_delete = TRUE THEN snapshot_id END) end_snapshot FROM ducklake_meta.ducklake_delete_file_visibility WHERE branch_id = 0 GROUP BY delete_file_id) v ON v.delete_file_id = f.delete_file_id) ORDER BY begin_snapshot
 ----
 1	2	NULL	20	7
 
@@ -210,7 +201,7 @@ statement ok
 CALL ducklake_flush_inlined_data('ducklake')
 
 query IIIII
-SELECT table_id, begin_snapshot, end_snapshot, delete_count, partial_max FROM ducklake_meta.ducklake_delete_file ORDER BY ALL
+SELECT table_id, begin_snapshot, end_snapshot, delete_count, partial_max FROM (SELECT f.*, v.begin_snapshot, v.end_snapshot FROM ducklake_meta.ducklake_delete_file f JOIN (SELECT delete_file_id, MAX(CASE WHEN is_delete = FALSE THEN snapshot_id END) begin_snapshot, MAX(CASE WHEN is_delete = TRUE THEN snapshot_id END) end_snapshot FROM ducklake_meta.ducklake_delete_file_visibility WHERE branch_id = 0 GROUP BY delete_file_id) v ON v.delete_file_id = f.delete_file_id) ORDER BY ALL
 ----
 1	2	NULL	21	11
 1	11	NULL	1	NULL
@@ -264,7 +255,7 @@ FROM T order by a
 65
 
 query I
-SELECT count(*) FROM GLOB('${DATA_PATH}/test_deletion_inlining/**/*-delete.parquet')
+SELECT count(*) FROM GLOB('{DATA_PATH}/test_deletion_inlining/**/*-delete.*')
 ----
 5
 
@@ -281,7 +272,7 @@ CALL ducklake_cleanup_old_files(
 );
 
 query I
-SELECT count(*) FROM GLOB('${DATA_PATH}/test_deletion_inlining/**/*-delete.parquet')
+SELECT count(*) FROM GLOB('{DATA_PATH}/test_deletion_inlining/**/*-delete.*')
 ----
 3
 

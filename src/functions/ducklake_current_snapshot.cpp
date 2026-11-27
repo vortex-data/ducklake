@@ -1,5 +1,6 @@
 #include "functions/ducklake_table_functions.hpp"
 #include "storage/ducklake_table_entry.hpp"
+#include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "common/ducklake_util.hpp"
 #include "storage/ducklake_transaction_changes.hpp"
@@ -8,8 +9,9 @@
 namespace duckdb {
 
 static unique_ptr<FunctionData> DuckLakeCurrentSnapshotBind(ClientContext &context, TableFunctionBindInput &input,
-                                                            vector<LogicalType> &return_types, vector<string> &names) {
-	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input.inputs[0]);
+                                                            vector<LogicalType> &return_types,
+                                                            vector<Identifier> &names) {
+	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input);
 	auto &transaction = DuckLakeTransaction::Get(context, catalog);
 
 	names.emplace_back("id");

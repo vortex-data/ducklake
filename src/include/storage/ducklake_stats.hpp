@@ -9,16 +9,38 @@
 #pragma once
 
 #include "storage/ducklake_extra_stats.hpp"
+#include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/common/types/value.hpp"
+
+#include <functional>
 
 namespace duckdb {
 class BaseStatistics;
+struct DuckLakeDataFile;
+struct DuckLakeGlobalStatsInfo;
 
 //! Returns true for types that require value-based (not lexicographic string) comparison for min/max stats
 inline bool RequiresValueComparison(const LogicalType &type) {
 	return type.IsNumeric() || type.IsTemporal() || type.id() == LogicalTypeId::BOOLEAN;
 }
 
+//! Finite bounds need an explicit UTC offset
+inline bool StatsBoundsRequireOffset(const LogicalType &type) {
+	return type.id() == LogicalTypeId::TIMESTAMP_TZ || type.id() == LogicalTypeId::TIMESTAMP_TZ_NS;
+}
+
+//! The file statistics of a nested column are per field, and the Parquet writer collects none for INTERVAL
+inline bool FileStatsShowNulls(const LogicalType &type) {
+	return !type.IsNested() && type.id() != LogicalTypeId::INTERVAL;
+}
+
+//! Bounds that cannot be cast are unknown
+optional<Value> TryCastStatsBound(const string &bound, const LogicalType &type);
+//! Orders two stats bounds of the same type, TIMETZ by instant as SQL does
+bool StatsBoundLessThan(const Value &left, const Value &right);
+
 struct DuckLakeColumnStats;
+struct DuckLakeGlobalColumnStatsInfo;
 
 struct DuckLakeColumnStats {
 	explicit DuckLakeColumnStats(LogicalType type_p);
@@ -41,7 +63,11 @@ struct DuckLakeColumnStats {
 	bool has_min = false;
 	bool has_max = false;
 	bool any_valid = true;
+	//! The table has rows without bounds, new values only set them once the live values are known to be NULL
+	bool bounds_unknown = false;
 	bool has_contains_nan = false;
+	bool min_is_exact = false;
+	bool max_is_exact = false;
 
 	bool AnyValid() const {
 		if (has_num_values && has_null_count) {
@@ -49,28 +75,83 @@ struct DuckLakeColumnStats {
 		}
 		return any_valid;
 	}
+	//! Extra statistics of unknown bounds that no value was merged into are unknown
+	bool ExtraStatsUnknown() const {
+		return bounds_unknown && !AnyValid();
+	}
+	//! Strings can have truncated min/max stats, other types are always exact
+	bool EffectiveMinIsExact() const {
+		return has_min && (min_is_exact || RequiresValueComparison(type));
+	}
+	bool EffectiveMaxIsExact() const {
+		return has_max && (max_is_exact || RequiresValueComparison(type));
+	}
 
 	unique_ptr<DuckLakeColumnExtraStats> extra_stats;
 
 public:
+	static DuckLakeColumnStats FromGlobalStats(const LogicalType &type, const DuckLakeGlobalColumnStatsInfo &col,
+	                                           bool table_has_rows);
+	//! The statistics of count values that are all the given value
+	static DuckLakeColumnStats FromConstant(const LogicalType &type, const Value &value, idx_t count);
+	//! Discards the min/max bounds, leaving the counts intact
+	void ClearBounds();
+	//! Rewrite FLOAT bounds as the DOUBLE values they widen to
+	void WidenFloatBounds();
+	//! Rewrite bounds of the source type as the values they cast to, dropping the bounds that do not cast
+	//! Returns the first exact bound that does not cast
+	optional<string> CastBoundsFrom(const LogicalType &source);
+	void CopyMinFrom(const DuckLakeColumnStats &other);
+	void CopyMaxFrom(const DuckLakeColumnStats &other);
+	static bool BoundsSurviveTypePromotion(const LogicalType &source, const LogicalType &target);
+	//! Whether the statistics of a type are built from its min, max and NaN flag
+	static bool StatsFromBounds(const LogicalType &type);
 	unique_ptr<BaseStatistics> ToStats() const;
 	void MergeStats(const DuckLakeColumnStats &new_stats);
 
 private:
+	void MergeBound(const DuckLakeColumnStats &new_stats, bool is_min);
+	void SetValidity(BaseStatistics &stats) const;
 	unique_ptr<BaseStatistics> CreateNumericStats() const;
 	unique_ptr<BaseStatistics> CreateStringStats() const;
 	unique_ptr<BaseStatistics> CreateVariantStats() const;
 	unique_ptr<BaseStatistics> CreateGeometryStats() const;
 };
 
+class DuckLakeFieldId;
+
+//! A leaf field that rows written without it read as NULL or as its default
+struct DuckLakeMissingField {
+	FieldIndex field_index;
+	LogicalType field_type;
+	bool reads_null;
+	//! Whether the column is inside a list or map element, so it does not have one value per row
+	bool repeated;
+
+	//! Collects the leaf fields of a missing field, whose own value reads as NULL if reads_null is set
+	static void Collect(const DuckLakeFieldId &field_id, bool reads_null, bool repeated,
+	                    vector<DuckLakeMissingField> &result);
+	//! Adds the statistics of count rows without the field, which are unknown unless it reads as NULL
+	void AddStats(idx_t count, map<FieldIndex, DuckLakeColumnStats> &result) const;
+};
+
 //! These are the global, table-wide stats
 struct DuckLakeTableStats {
 	idx_t record_count = 0;
+	bool record_count_unknown = false;
 	idx_t table_size_bytes = 0;
 	idx_t next_row_id = 0;
 	map<FieldIndex, DuckLakeColumnStats> column_stats;
 
 	void MergeStats(FieldIndex col_id, const DuckLakeColumnStats &file_stats);
+
+	//! Merges a file with the given column stats, which can differ from the file's own
+	void MergeFileStats(const DuckLakeDataFile &file, const map<FieldIndex, DuckLakeColumnStats> &column_stats);
+
+	//! Skips columns whose type lookup returns nullptr
+	static unique_ptr<DuckLakeTableStats>
+	FromGlobalStats(const DuckLakeGlobalStatsInfo &stats,
+	                const std::function<optional_ptr<const LogicalType>(FieldIndex)> &get_column_type);
 };
 
 struct DuckLakeStats {

@@ -37,7 +37,6 @@ COPY (SELECT i, s FROM ducklake.t ORDER BY i) TO '{TEST_DIR}/injected.vortex' (F
 statement ok
 UPDATE ducklake_meta.ducklake_data_file
 SET path = '{TEST_DIR}/injected.vortex', path_is_relative = false, file_format = 'vortex'
-WHERE end_snapshot IS NULL
 
 statement ok
 DETACH ducklake

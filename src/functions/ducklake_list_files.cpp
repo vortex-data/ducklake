@@ -1,4 +1,5 @@
 #include "functions/ducklake_table_functions.hpp"
+#include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "common/ducklake_util.hpp"
@@ -33,8 +34,8 @@ static void AddFileInfo(DuckLakeFileData &file_info, vector<Value> &row_values) 
 }
 
 static unique_ptr<FunctionData> DuckLakeListFilesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                      vector<LogicalType> &return_types, vector<string> &names) {
-	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input.inputs[0]);
+                                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
+	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input);
 	auto &transaction = DuckLakeTransaction::Get(context, catalog);
 
 	names.emplace_back("data_file");
@@ -61,34 +62,37 @@ static unique_ptr<FunctionData> DuckLakeListFilesBind(ClientContext &context, Ta
 	names.emplace_back("delete_file_encryption_key");
 	return_types.emplace_back(LogicalType::BLOB);
 
-	string schema;
-	auto schema_entry = input.named_parameters.find("schema");
-	if (schema_entry != input.named_parameters.end()) {
-		schema = StringValue::Get(schema_entry->second);
-	}
+	auto schema = DuckLakeTableFunctionUtil::GetStringOption(input, "schema");
 	// generate the AT clause for the given list of parameters
 	unique_ptr<BoundAtClause> at_clause;
-	auto version_entry = input.named_parameters.find("snapshot_version");
-	if (version_entry != input.named_parameters.end()) {
-		at_clause = make_uniq<BoundAtClause>("version", version_entry->second);
+	Value snapshot_version;
+	if (DuckLakeTableFunctionUtil::TryGetNonNullOption(input, "snapshot_version", "snapshot id or tag name",
+	                                                   snapshot_version)) {
+		if (snapshot_version.type().id() == LogicalTypeId::TIMESTAMP_TZ) {
+			throw BinderException("The snapshot_version option must be a snapshot id or a tag name, snapshot_time "
+			                      "takes a timestamp");
+		}
+		at_clause = make_uniq<BoundAtClause>(DuckLakeTableFunctionUtil::VersionAtClauseFromValue(snapshot_version));
 	}
-	auto time_entry = input.named_parameters.find("snapshot_time");
-	if (time_entry != input.named_parameters.end()) {
+	Value snapshot_time;
+	if (DuckLakeTableFunctionUtil::TryGetNonNullOption(input, "snapshot_time", "timestamp", snapshot_time)) {
 		if (at_clause) {
 			throw InvalidInputException("Either snapshot_version OR snapshot_time must be specified - not both");
 		}
-		at_clause = make_uniq<BoundAtClause>("timestamp", time_entry->second);
+		at_clause = make_uniq<BoundAtClause>(DuckLakeTableFunctionUtil::AtClauseFromValue(snapshot_time));
 	}
-	auto table_name = StringValue::Get(input.inputs[1]);
-	EntryLookupInfo table_lookup(CatalogType::TABLE_ENTRY, table_name, at_clause.get(), QueryErrorContext());
-	auto table_entry = catalog.GetEntry(context, schema, table_lookup, OnEntryNotFound::THROW_EXCEPTION);
-	auto &ducklake_table = table_entry->Cast<DuckLakeTableEntry>();
+	auto table_name = DuckLakeTableFunctionUtil::GetTableName(input.inputs[1]);
+	EntryLookupInfo table_lookup(CatalogType::TABLE_ENTRY, QualifiedName(Identifier(table_name)), at_clause.get(),
+	                             QueryErrorContext());
+	auto &ducklake_table = DuckLakeBaseMetadataFunction::GetTableEntry(context, catalog, schema, table_lookup);
 	auto snapshot = transaction.GetSnapshot(at_clause.get());
 
 	// fetch the file list
 	auto &metadata_manager = transaction.GetMetadataManager();
 	// FIXME: support predicate pushdown
-	auto files = metadata_manager.GetFilesForTable(ducklake_table, snapshot, nullptr);
+	// only the files are listed, not the columns of the inlined rows
+	vector<DuckLakeProjectedColumn> no_columns;
+	auto files = metadata_manager.GetFilesForTable(ducklake_table, snapshot, nullptr, true, no_columns);
 	// generate the result
 	auto result = make_uniq<MetadataBindData>();
 	for (auto &file : files) {
@@ -106,10 +110,13 @@ static unique_ptr<FunctionData> DuckLakeListFilesBind(ClientContext &context, Ta
 
 DuckLakeListFilesFunction::DuckLakeListFilesFunction()
     : DuckLakeBaseMetadataFunction("ducklake_list_files", DuckLakeListFilesBind) {
-	arguments.push_back(LogicalType::VARCHAR);
-	named_parameters["schema"] = LogicalType::VARCHAR;
-	named_parameters["snapshot_version"] = LogicalType::BIGINT;
-	named_parameters["snapshot_time"] = LogicalType::TIMESTAMP_TZ;
+	GetSignature()
+	    .AddPositionalOnly("table_name", LogicalType::VARCHAR)
+	    .WithTypedKwargs("options", [&](TypedKwargs &options) {
+		    options.Add("schema", LogicalType::VARCHAR)
+		        .Add("snapshot_version", LogicalType::ANY)
+		        .Add("snapshot_time", LogicalType::TIMESTAMP_TZ);
+	    });
 }
 
 } // namespace duckdb

@@ -15,14 +15,17 @@
 
 namespace duckdb {
 class DuckLakeInsert;
+class DuckLakeTableEntry;
+struct DuckLakeInlinedData;
 
 class DuckLakeInlineData : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
 public:
-	DuckLakeInlineData(PhysicalPlan &physical_plan, PhysicalOperator &child, idx_t inline_row_limit);
+	DuckLakeInlineData(PhysicalPlan &physical_plan, PhysicalOperator &child, Catalog &catalog, idx_t inline_row_limit);
 
+	Catalog &catalog;
 	idx_t inline_row_limit;
 	optional_ptr<DuckLakeInsert> insert;
 
@@ -46,6 +49,8 @@ public:
 		return true;
 	}
 	string GetName() const override;
+
+	static void RecomputeColumnStats(DuckLakeTableEntry &table, DuckLakeInlinedData &inlined_data);
 };
 
 } // namespace duckdb

@@ -6,13 +6,12 @@ require ducklake
 
 require parquet
 
-test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
 
-test-env DATA_PATH __TEST_DIR__
-
+test-env DATA_PATH {TEST_DIR}
 
 statement ok
-ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/rewrite_partitioned', METADATA_CATALOG 'ducklake_metadata')
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/rewrite_partitioned', METADATA_CATALOG 'ducklake_metadata', DATA_INLINING_ROW_LIMIT 0)
 
 statement ok
 USE ducklake
@@ -24,24 +23,16 @@ CREATE TABLE partitioned(part_key INTEGER, id INTEGER, value INTEGER);
 statement ok
 ALTER TABLE partitioned SET PARTITIONED BY (part_key);
 
-# Initial data load into multiple partitions
+# Initial data load into multiple partitions (inlining disabled so it creates a file)
 statement ok
 INSERT INTO partitioned VALUES (1, 1, 10), (1, 2, 20);
-
-# flush to create file
-statement ok
-CALL ducklake_flush_inlined_data('ducklake')
 
 statement ok
 INSERT INTO partitioned VALUES (2, 1, 100), (2, 2, 200);
 
-# flush to create file
-statement ok
-CALL ducklake_flush_inlined_data('ducklake')
-
 # We should have 2 data files (one per insert, but inserts had multiple rows)
 query I
-SELECT COUNT(*) FROM GLOB('${DATA_PATH}/rewrite_partitioned/**/*.parquet')
+SELECT COUNT(*) FROM GLOB('{DATA_PATH}/rewrite_partitioned/**/*.parquet')
 ----
 2
 
@@ -58,13 +49,9 @@ ON (target.part_key = source.part_key AND target.id = source.id)
 WHEN MATCHED THEN UPDATE SET value = source.value
 WHEN NOT MATCHED THEN INSERT *;
 
-# flush to create delete files from inlined deletions
-statement ok
-CALL ducklake_flush_inlined_data('ducklake')
-
 # Verify delete files were created by MERGE
 query I
-SELECT COUNT(*) FROM ducklake_metadata.ducklake_delete_file WHERE end_snapshot IS NULL
+SELECT coalesce(sum(delete_file_count), 0)::BIGINT FROM ducklake_table_info('ducklake')
 ----
 2
 
@@ -89,7 +76,7 @@ partitioned	1	1
 
 # After rewrite, delete files should be gone (applied to new data files)
 query I
-SELECT COUNT(*) FROM ducklake_metadata.ducklake_delete_file WHERE end_snapshot IS NULL
+SELECT coalesce(sum(delete_file_count), 0)::BIGINT FROM ducklake_table_info('ducklake')
 ----
 0
 
@@ -118,7 +105,7 @@ CALL ducklake_cleanup_old_files('ducklake', cleanup_all => true);
 # Verify partition info is preserved correctly - should have 2 files (one per partition)
 query II
 SELECT partition_id, partition_value
-FROM ducklake_metadata.ducklake_data_file
+FROM (SELECT f.*, v.begin_snapshot, v.end_snapshot FROM ducklake_metadata.ducklake_data_file f JOIN (SELECT data_file_id, MAX(CASE WHEN is_delete = FALSE THEN snapshot_id END) begin_snapshot, MAX(CASE WHEN is_delete = TRUE THEN snapshot_id END) end_snapshot FROM ducklake_metadata.ducklake_file_visibility WHERE branch_id = 0 GROUP BY data_file_id) v ON v.data_file_id = f.data_file_id)
 JOIN ducklake_metadata.ducklake_file_partition_value USING (data_file_id)
 WHERE end_snapshot IS NULL
 ORDER BY partition_value

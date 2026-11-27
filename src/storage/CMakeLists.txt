@@ -16,6 +16,7 @@ add_library(
   ducklake_transaction_manager.cpp
   ducklake_catalog_set.cpp
   ducklake_metadata_manager.cpp
+  ducklake_metadata_profile.cpp
   ducklake_multi_file_list.cpp
   ducklake_storage.cpp
   ducklake_delete.cpp
@@ -23,14 +24,18 @@ add_library(
   ducklake_multi_file_reader.cpp
   ducklake_format_reader.cpp
   ducklake_partition_data.cpp
+  ducklake_puffin.cpp
   ducklake_secret.cpp
+  ducklake_sort_data.cpp
+  ducklake_server_side_commit.cpp
+  ducklake_staged_commit.cpp
   ducklake_stats.cpp
   ducklake_table_entry.cpp
   ducklake_initializer.cpp
-  ducklake_autoload_helper.cpp
   ducklake_update.cpp
   ducklake_scan.cpp
   ducklake_transaction.cpp
+  ducklake_transaction_state.cpp
   ducklake_view_entry.cpp
   ducklake_transaction_changes.cpp)
 set(ALL_OBJECT_FILES

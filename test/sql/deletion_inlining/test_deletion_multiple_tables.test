@@ -6,12 +6,12 @@ require ducklake
 
 require parquet
 
-test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
 
-test-env DATA_PATH __TEST_DIR__
+test-env DATA_PATH {TEST_DIR}
 
 statement ok
-ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/test_deletion_multiple_tables',DATA_INLINING_ROW_LIMIT 10)
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/test_deletion_multiple_tables',DATA_INLINING_ROW_LIMIT 10)
 
 statement ok
 use ducklake
@@ -54,7 +54,7 @@ CALL ducklake_flush_inlined_data('ducklake');
 
 # We get a single delete file per table
 query IIII
-SELECT  table_id, begin_snapshot, end_snapshot, delete_count FROM __ducklake_metadata_ducklake.ducklake_delete_file ORDER BY table_id
+SELECT  table_id, begin_snapshot, end_snapshot, delete_count FROM (SELECT f.*, v.begin_snapshot, v.end_snapshot FROM __ducklake_metadata_ducklake.ducklake_delete_file f JOIN (SELECT delete_file_id, MAX(CASE WHEN is_delete = FALSE THEN snapshot_id END) begin_snapshot, MAX(CASE WHEN is_delete = TRUE THEN snapshot_id END) end_snapshot FROM __ducklake_metadata_ducklake.ducklake_delete_file_visibility WHERE branch_id = 0 GROUP BY delete_file_id) v ON v.delete_file_id = f.delete_file_id) ORDER BY table_id
 ----
 1	5	NULL	5
 2	8	NULL	5

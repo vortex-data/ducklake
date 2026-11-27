@@ -19,6 +19,8 @@
 #include "common/index.hpp"
 
 namespace duckdb {
+struct DuckLakeColumnMappingInfo;
+struct DuckLakeNameMapColumnInfo;
 
 struct DuckLakeNameMapEntry {
 	string source_name;
@@ -39,6 +41,14 @@ struct DuckLakeNameMap {
 
 	hash_t GetHash() const;
 	bool IsCompatibleWith(const DuckLakeNameMap &other) const;
+
+	//! Create a positional name mapping from source column names to target field IDs.
+	static vector<unique_ptr<DuckLakeNameMapEntry>> CreatePositionalMapping(const vector<string> &source_names,
+	                                                                        const vector<FieldIndex> &target_field_ids);
+	//! Requires parents before children
+	static unique_ptr<DuckLakeNameMap> FromColumnMapping(DuckLakeColumnMappingInfo column_mapping);
+	//! Pre-order, so parents precede children
+	vector<DuckLakeNameMapColumnInfo> FlattenColumns() const;
 };
 
 struct NameMapHashFunction {
@@ -57,12 +67,13 @@ using ducklake_name_map_compatibility_set =
     unordered_set<const_reference<DuckLakeNameMap>, NameMapHashFunction, NameMapIsCompatible>;
 
 struct DuckLakeNameMapSet {
-	map<MappingIndex, unique_ptr<DuckLakeNameMap>> name_maps;
+	map<MappingIndex, shared_ptr<DuckLakeNameMap>> name_maps;
 	ducklake_name_map_compatibility_set name_map_compatibility_set;
 
 	//! Try to find a compatible name map that already exists in the set
 	MappingIndex TryGetCompatibleNameMap(const DuckLakeNameMap &name_map);
 	void Add(unique_ptr<DuckLakeNameMap> name_map);
+	void Remove(MappingIndex mapping_id);
 };
 
 } // namespace duckdb

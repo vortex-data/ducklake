@@ -1,14 +1,13 @@
 #include "storage/ducklake_update.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 
 #include "duckdb/common/mutex.hpp"
-#include "duckdb/common/types/hash.hpp"
-#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
+#include "duckdb/execution/row_id_deduplicator.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "storage/ducklake_delete.hpp"
-#include "storage/ducklake_inline_data.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_schema_entry.hpp"
@@ -19,26 +18,11 @@
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/planner/operator/logical_projection.hpp"
-#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/execution/operator/persistent/physical_merge_into.hpp"
 
 namespace duckdb {
-
-struct FileRowId {
-	uint64_t file_index;
-	int64_t row_number;
-
-	bool operator==(const FileRowId &other) const {
-		return file_index == other.file_index && row_number == other.row_number;
-	}
-};
-
-struct FileRowIdHash {
-	hash_t operator()(const FileRowId &id) const {
-		return CombineHash(Hash(id.file_index), Hash(id.row_number));
-	}
-};
 
 DuckLakeUpdate::DuckLakeUpdate(PhysicalPlan &physical_plan, DuckLakeTableEntry &table, vector<PhysicalIndex> columns_p,
                                PhysicalOperator &child, PhysicalOperator &delete_op,
@@ -54,14 +38,13 @@ DuckLakeUpdate::DuckLakeUpdate(PhysicalPlan &physical_plan, DuckLakeTableEntry &
 //===--------------------------------------------------------------------===//
 class DuckLakeUpdateGlobalState : public GlobalOperatorState {
 public:
-	DuckLakeUpdateGlobalState() : total_updated_count(0) {
+	explicit DuckLakeUpdateGlobalState(ClientContext &context)
+	    : seen_rows(context, {LogicalType::UBIGINT, LogicalType::BIGINT}) {
 	}
-
-	atomic<idx_t> total_updated_count;
 
 	//! Duplicate row detection (first-write-wins)
 	mutex seen_rows_lock;
-	unordered_set<FileRowId, FileRowIdHash> seen_rows;
+	RowIdDeduplicator seen_rows;
 };
 
 class DuckLakeUpdateLocalState : public OperatorState {
@@ -72,11 +55,10 @@ public:
 	DataChunk update_expression_chunk;
 	DataChunk insert_chunk;
 	DataChunk delete_chunk;
-	idx_t updated_count = 0;
 };
 
 unique_ptr<GlobalOperatorState> DuckLakeUpdate::GetGlobalOperatorState(ClientContext &context) const {
-	auto result = make_uniq<DuckLakeUpdateGlobalState>();
+	auto result = make_uniq<DuckLakeUpdateGlobalState>(context);
 	// init delete_op sink state
 	delete_op.sink_state = delete_op.GetGlobalSinkState(context);
 	return std::move(result);
@@ -94,7 +76,7 @@ unique_ptr<OperatorState> DuckLakeUpdate::GetOperatorState(ExecutionContext &con
 	vector<LogicalType> expression_types;
 	result->expression_executor = make_uniq<ExpressionExecutor>(context.client, expressions);
 	for (auto &expr : result->expression_executor->expressions) {
-		expression_types.push_back(expr->return_type);
+		expression_types.push_back(expr->GetReturnType());
 	}
 
 	result->update_expression_chunk.Initialize(context.client, expression_types);
@@ -114,27 +96,11 @@ OperatorResultType DuckLakeUpdate::Execute(ExecutionContext &context, DataChunk 
 
 	// filter duplicate row IDs using deletion info (last 3 columns)
 	idx_t delete_idx_start = input.ColumnCount() - DELETION_INFO_SIZE;
-	auto &file_index_vec = input.data[delete_idx_start + 1];
-	auto &row_number_vec = input.data[delete_idx_start + 2];
-
-	UnifiedVectorFormat file_index_data, row_number_data;
-	file_index_vec.ToUnifiedFormat(input.size(), file_index_data);
-	row_number_vec.ToUnifiedFormat(input.size(), row_number_data);
-	auto file_indices = UnifiedVectorFormat::GetData<uint64_t>(file_index_data);
-	auto row_numbers = UnifiedVectorFormat::GetData<int64_t>(row_number_data);
-
 	SelectionVector sel(input.size());
-	idx_t sel_count = 0;
+	idx_t sel_count;
 	{
 		lock_guard<mutex> guard(gstate.seen_rows_lock);
-		for (idx_t i = 0; i < input.size(); i++) {
-			auto file_idx = file_index_data.sel->get_index(i);
-			auto row_idx = row_number_data.sel->get_index(i);
-			FileRowId key {file_indices[file_idx], row_numbers[row_idx]};
-			if (gstate.seen_rows.insert(key).second) {
-				sel.set_index(sel_count++, i);
-			}
-		}
+		sel_count = gstate.seen_rows.Register(input, delete_idx_start + 1, sel);
 	}
 
 	if (sel_count == 0) {
@@ -149,8 +115,6 @@ OperatorResultType DuckLakeUpdate::Execute(ExecutionContext &context, DataChunk 
 	auto &update_expression_chunk = lstate.update_expression_chunk;
 	auto &insert_chunk = lstate.insert_chunk;
 
-	update_expression_chunk.SetCardinality(input.size());
-	insert_chunk.SetCardinality(input.size());
 	lstate.expression_executor->Execute(input, update_expression_chunk);
 
 	const idx_t physical_column_count = columns.size();
@@ -161,26 +125,24 @@ OperatorResultType DuckLakeUpdate::Execute(ExecutionContext &context, DataChunk 
 	}
 	// we place row_id right after physical columns
 	insert_chunk.data[physical_column_count].Reference(input.data[row_id_index]);
+	insert_chunk.SetChildCardinality(input.size());
 
 	chunk.Reference(insert_chunk);
 
 	auto &delete_chunk = lstate.delete_chunk;
-	delete_chunk.SetCardinality(input.size());
 	for (idx_t i = 0; i < DELETION_INFO_SIZE; i++) {
 		delete_chunk.data[i].Reference(input.data[delete_idx_start + i]);
 	}
+	delete_chunk.SetChildCardinality(input.size());
 
 	InterruptState interrupt_state;
 	OperatorSinkInput delete_input {*delete_op.sink_state, *lstate.delete_local_state, interrupt_state};
 	delete_op.Sink(context, delete_chunk, delete_input);
-
-	lstate.updated_count += input.size();
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 
 OperatorFinalizeResultType DuckLakeUpdate::FinalExecute(ExecutionContext &context, DataChunk &chunk,
                                                         GlobalOperatorState &gstate_p, OperatorState &state_p) const {
-	auto &gstate = gstate_p.Cast<DuckLakeUpdateGlobalState>();
 	auto &lstate = state_p.Cast<DuckLakeUpdateLocalState>();
 
 	InterruptState interrupt_state;
@@ -189,7 +151,6 @@ OperatorFinalizeResultType DuckLakeUpdate::FinalExecute(ExecutionContext &contex
 	if (result != SinkCombineResultType::FINISHED) {
 		throw InternalException("DuckLakeUpdate::FinalExecute does not support async child operators");
 	}
-	gstate.total_updated_count += lstate.updated_count;
 	return OperatorFinalizeResultType::FINISHED;
 }
 
@@ -212,7 +173,7 @@ string DuckLakeUpdate::GetName() const {
 
 InsertionOrderPreservingMap<string> DuckLakeUpdate::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
-	result["Table Name"] = table.name;
+	result["Table Name"] = table.name.GetIdentifierName();
 	return result;
 }
 
@@ -220,7 +181,7 @@ DuckLakeUpdate &DuckLakeUpdate::PlanUpdateOperator(ClientContext &context, Physi
                                                    LogicalUpdate &op, PhysicalOperator &child_plan,
                                                    DuckLakeCopyInput &copy_input) {
 	for (auto &expr : op.expressions) {
-		if (expr->type == ExpressionType::VALUE_DEFAULT) {
+		if (expr->GetExpressionType() == ExpressionType::VALUE_DEFAULT) {
 			throw BinderException("SET DEFAULT is not yet supported for updates of a DuckLake table");
 		}
 	}
@@ -234,13 +195,9 @@ DuckLakeUpdate &DuckLakeUpdate::PlanUpdateOperator(ClientContext &context, Physi
 	                                             copy_input.encryption_key, false);
 
 	// build update expressions (physical columns only, no partition cols, no casts)
-	vector<unique_ptr<Expression>> expressions;
-	unordered_map<idx_t, idx_t> expression_map;
+	vector<unique_ptr<Expression>> expressions(op.columns.size());
 	for (idx_t i = 0; i < op.columns.size(); i++) {
-		expression_map[op.columns[i].index] = i;
-	}
-	for (idx_t i = 0; i < op.columns.size(); i++) {
-		expressions.push_back(op.expressions[expression_map[i]]->Copy());
+		expressions[op.columns[i].index] = op.expressions[i]->Copy();
 	}
 
 	auto &update_op =
@@ -249,11 +206,20 @@ DuckLakeUpdate &DuckLakeUpdate::PlanUpdateOperator(ClientContext &context, Physi
 	// set output types we use physical column types + BIGINT row_id
 	vector<LogicalType> update_output_types;
 	for (auto &expr : update_op.expressions) {
-		update_output_types.push_back(expr->return_type);
+		update_output_types.push_back(expr->GetReturnType());
 	}
 	update_output_types.push_back(LogicalType::BIGINT);
 	update_op.types = std::move(update_output_types);
 	return update_op;
+}
+
+//! Whether the plan is the input of a MERGE action, which cannot hold a MERGE of its own
+static bool IsMergeActionInput(PhysicalOperator &plan) {
+	reference<PhysicalOperator> op = plan;
+	while (op.get().type == PhysicalOperatorType::PROJECTION && !op.get().children.empty()) {
+		op = op.get().children[0];
+	}
+	return op.get().type == PhysicalOperatorType::MERGE_ACTION_SOURCE;
 }
 
 PhysicalOperator &DuckLakeCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
@@ -266,69 +232,58 @@ PhysicalOperator &DuckLakeCatalog::PlanUpdate(ClientContext &context, PhysicalPl
 	DuckLakeCopyInput copy_input(context, table);
 	copy_input.virtual_columns = InsertVirtualColumns::WRITE_ROW_ID;
 	auto &update_op = DuckLakeUpdate::PlanUpdateOperator(context, planner, op, child_plan, copy_input);
+	auto &verified_plan = DuckLakeVerifyNotNull::Plan(planner, table, update_op);
 
+	auto &transaction = DuckLakeTransaction::Get(context, *this);
+	if (!transaction.HasTransactionLocalInserts(table.GetTableId()) || IsMergeActionInput(child_plan)) {
+		return PlanUpdateInsert(context, planner, table, verified_plan, copy_input);
+	}
+	// rows inserted in this transaction get their row ids at commit, so their new versions are written without them
+	auto row_id_index = update_op.row_id_index;
+	auto local_rows = make_uniq<MergeIntoOperator>();
+	local_rows->action_type = MergeActionType::MERGE_INSERT;
+	local_rows->condition = BoundComparisonExpression::Create(
+	    ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+	    make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, row_id_index),
+	    make_uniq<BoundConstantExpression>(
+	        Value::BIGINT(NumericCast<int64_t>(DuckLakeConstants::TRANSACTION_LOCAL_ROW_ID_START))));
+	for (idx_t col_idx = 0; col_idx < row_id_index; col_idx++) {
+		local_rows->expressions.push_back(make_uniq<BoundReferenceExpression>(verified_plan.types[col_idx], col_idx));
+	}
+	auto &local_input = PlanMergeActionSource(planner, verified_plan, MergeActionCondition::WHEN_MATCHED, *local_rows);
+	DuckLakeCopyInput local_copy_input(context, table);
+	local_rows->op = PlanUpdateInsert(context, planner, table, local_input, local_copy_input);
+
+	auto committed_rows = make_uniq<MergeIntoOperator>();
+	committed_rows->action_type = MergeActionType::MERGE_INSERT;
+	auto &committed_input =
+	    PlanMergeActionSource(planner, verified_plan, MergeActionCondition::WHEN_MATCHED, *committed_rows);
+	committed_rows->op = PlanUpdateInsert(context, planner, table, committed_input, copy_input);
+
+	map<MergeActionCondition, vector<unique_ptr<MergeIntoOperator>>> actions;
+	auto &matched_actions = actions[MergeActionCondition::WHEN_MATCHED];
+	matched_actions.push_back(std::move(local_rows));
+	matched_actions.push_back(std::move(committed_rows));
+	return planner.Make<PhysicalMergeInto>(op.types, verified_plan, std::move(actions), row_id_index, optional_idx(),
+	                                       true, false);
+}
+
+PhysicalOperator &DuckLakeCatalog::PlanUpdateInsert(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                    DuckLakeTableEntry &table, PhysicalOperator &plan,
+                                                    DuckLakeCopyInput &copy_input) {
 	// follow the insert path for inlining
-	optional_ptr<PhysicalOperator> plan = &update_op;
-	optional_ptr<DuckLakeInlineData> inline_data;
-
-	idx_t data_inlining_row_limit = GetInliningLimit(context, table, plan->types);
-	if (data_inlining_row_limit > 0) {
-		plan = planner.Make<DuckLakeInlineData>(*plan, data_inlining_row_limit);
-		inline_data = plan->Cast<DuckLakeInlineData>();
-	}
-
-	auto &physical_copy = DuckLakeInsert::PlanCopyForInsert(context, planner, copy_input, plan);
+	auto pipeline = DuckLakeInsert::PlanInsertPipeline(context, planner, plan, table.schema, table.GetColumns(),
+	                                                   table.name, nullptr, false, GetInliningLimit(context, table));
+	auto &physical_copy = DuckLakeInsert::PlanCopyForInsert(context, planner, copy_input, pipeline.root.get());
 	auto &insert_op = DuckLakeInsert::PlanInsert(context, planner, table, std::move(copy_input.encryption_key));
-	if (inline_data) {
-		inline_data->insert = insert_op.Cast<DuckLakeInsert>();
-	}
-	insert_op.children.push_back(physical_copy);
-	return insert_op;
+	return pipeline.AttachInsert(insert_op, physical_copy);
 }
 
 void DuckLakeTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &get, LogicalProjection &proj,
                                                LogicalUpdate &update, ClientContext &context) {
 	// all updates in DuckLake are deletes + inserts
 	update.update_is_del_and_insert = true;
-
-	// push projections for all columns that are not projected yet
-	// FIXME: this is almost a copy of LogicalUpdate::BindExtraColumns aside from the duplicate elimination
-	// add that to main DuckDB
-	auto &column_ids = get.GetColumnIds();
-	for (auto &column : columns.Physical()) {
-		auto physical_index = column.Physical();
-		bool found = false;
-		for (auto &col : update.columns) {
-			if (col == physical_index) {
-				found = true;
-				break;
-			}
-		}
-		if (found) {
-			// already updated
-			continue;
-		}
-		// check if the column is already projected
-		optional_idx column_id_index;
-		for (idx_t i = 0; i < column_ids.size(); i++) {
-			if (column_ids[i].GetPrimaryIndex() == physical_index.index) {
-				column_id_index = i;
-				break;
-			}
-		}
-		if (!column_id_index.IsValid()) {
-			// not yet projected - add to a projection list
-			column_id_index = column_ids.size();
-			get.AddColumnId(physical_index.index);
-		}
-		// column is not projected yet: project it by adding the clause "i=i" to the set of updated columns
-		update.expressions.push_back(make_uniq<BoundColumnRefExpression>(
-		    column.Type(), ColumnBinding(proj.table_index, proj.expressions.size())));
-		proj.expressions.push_back(make_uniq<BoundColumnRefExpression>(
-		    column.Type(), ColumnBinding(get.table_index, column_id_index.GetIndex())));
-		get.AddColumnId(physical_index.index);
-		update.columns.push_back(physical_index);
-	}
+	LogicalUpdate::BindAllColumns(*this, get, proj, update, true);
 }
 
 } // namespace duckdb

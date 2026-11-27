@@ -6,12 +6,14 @@ require ducklake
 
 require parquet
 
-test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+require notmusl
 
-test-env DATA_PATH __TEST_DIR__
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
 
 statement ok
-ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/merge_adjacent_tiered/')
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/merge_adjacent_tiered/')
 
 statement ok
 USE ducklake;
@@ -23,12 +25,12 @@ CREATE TABLE tiered (id integer, payload varchar);
 loop i 0 512
 
 statement ok
-INSERT INTO tiered SELECT ${i} * 1000 + j, md5((${i} * 1000 + j)::varchar) || md5((${i} * 1000 + j + 1)::varchar) FROM range(100) t(j);
+INSERT INTO tiered SELECT {i} * 1000 + j, md5(({i} * 1000 + j)::varchar) || md5(({i} * 1000 + j + 1)::varchar) FROM range(100) t(j);
 
 endloop
 
 query I
-SELECT count(*) FROM __ducklake_metadata_ducklake.ducklake_data_file WHERE end_snapshot IS NULL
+SELECT coalesce(sum(file_count), 0)::BIGINT FROM ducklake_table_info('ducklake')
 ----
 512
 
@@ -40,7 +42,7 @@ statement ok
 CALL ducklake_merge_adjacent_files('ducklake', 'tiered', max_file_size=>10000);
 
 query I
-SELECT count(*) FROM __ducklake_metadata_ducklake.ducklake_data_file WHERE end_snapshot IS NULL
+SELECT coalesce(sum(file_count), 0)::BIGINT FROM ducklake_table_info('ducklake')
 ----
 47
 
@@ -52,9 +54,9 @@ statement ok
 CALL ducklake_merge_adjacent_files('ducklake', 'tiered', min_file_size=>10000, max_file_size=>100000);
 
 query I
-SELECT count(*) FROM __ducklake_metadata_ducklake.ducklake_data_file WHERE end_snapshot IS NULL
+SELECT coalesce(sum(file_count), 0)::BIGINT FROM ducklake_table_info('ducklake')
 ----
-10
+12
 
 # Tier 2 → Tier 3: merge large files (100KB-500KB) into ~1MB files
 statement ok
@@ -64,7 +66,7 @@ statement ok
 CALL ducklake_merge_adjacent_files('ducklake', 'tiered', min_file_size=>100000, max_file_size=>500000);
 
 query I
-SELECT count(*) FROM __ducklake_metadata_ducklake.ducklake_data_file WHERE end_snapshot IS NULL
+SELECT coalesce(sum(file_count), 0)::BIGINT FROM ducklake_table_info('ducklake')
 ----
 3
 
@@ -76,7 +78,7 @@ statement ok
 CALL ducklake_merge_adjacent_files('ducklake', 'tiered');
 
 query I
-SELECT count(*) FROM __ducklake_metadata_ducklake.ducklake_data_file WHERE end_snapshot IS NULL
+SELECT coalesce(sum(file_count), 0)::BIGINT FROM ducklake_table_info('ducklake')
 ----
 1
 

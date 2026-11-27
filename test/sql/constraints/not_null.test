@@ -6,13 +6,13 @@ require ducklake
 
 require parquet
 
-test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/ducklake_not_null.db
 
-test-env DATA_PATH __TEST_DIR__
+test-env DATA_PATH {TEST_DIR}
 
 
 statement ok
-ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_not_null_files')
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/ducklake_not_null_files')
 
 statement ok
 CREATE TABLE ducklake.test(i INTEGER NOT NULL, j INTEGER);
@@ -32,17 +32,13 @@ DESCRIBE ducklake.test
 i	INTEGER	NO	NULL	NULL	NULL
 j	INTEGER	YES	NULL	NULL	NULL
 
-# we cannot add a null constraint to a column that already has it
-statement error
+# a null constraint on a column that already has it changes nothing
+statement ok
 ALTER TABLE ducklake.test ALTER i SET NOT NULL;
-----
-already
 
-# we cannot drop the null constraint from a column that does not have it
-statement error
+# dropping the null constraint from a column that does not have it changes nothing
+statement ok
 ALTER TABLE ducklake.test ALTER j DROP NOT NULL;
-----
-no NOT NULL constraint
 
 # column does not exist
 statement error
@@ -94,7 +90,7 @@ INSERT INTO ducklake.test VALUES (NULL, 84)
 statement error
 ALTER TABLE ducklake.test ALTER i SET NOT NULL;
 ----
-transaction-local
+has NULL values
 
 statement ok
 ROLLBACK
@@ -108,3 +104,172 @@ has NULL values
 # after dropping the constraint - we can add NULL rows
 statement ok
 INSERT INTO ducklake.test VALUES (NULL, 84)
+
+# setting NOT NULL should inspect the live rows, not only stale insert-time stats
+statement ok
+CREATE TABLE ducklake.issue_1158(i INTEGER);
+
+statement ok
+INSERT INTO ducklake.issue_1158 VALUES (NULL), (1);
+
+statement ok
+DELETE FROM ducklake.issue_1158 WHERE i IS NULL;
+
+query I
+SELECT count(*) FROM ducklake.issue_1158 WHERE i IS NULL;
+----
+0
+
+statement ok
+ALTER TABLE ducklake.issue_1158 ALTER i SET NOT NULL;
+
+statement error
+INSERT INTO ducklake.issue_1158 VALUES (NULL);
+----
+NOT NULL constraint failed
+
+statement ok
+CREATE TABLE ducklake.issue_1158_transaction(i INTEGER);
+
+statement ok
+INSERT INTO ducklake.issue_1158_transaction VALUES (NULL), (1);
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM ducklake.issue_1158_transaction WHERE i IS NULL;
+
+statement ok
+ALTER TABLE ducklake.issue_1158_transaction ALTER i SET NOT NULL;
+
+statement ok
+COMMIT;
+
+statement error
+INSERT INTO ducklake.issue_1158_transaction VALUES (NULL);
+----
+NOT NULL constraint failed
+
+statement ok
+CREATE TABLE ducklake.not_null_after_local_insert(i INTEGER);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO ducklake.not_null_after_local_insert VALUES (1);
+
+statement ok
+ALTER TABLE ducklake.not_null_after_local_insert ALTER i SET NOT NULL;
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO ducklake.not_null_after_local_insert VALUES (NULL);
+
+statement error
+ALTER TABLE ducklake.not_null_after_local_insert ALTER i SET NOT NULL;
+----
+has NULL values
+
+statement ok
+ROLLBACK;
+
+statement ok
+CREATE TABLE ducklake.not_null_after_update(i INTEGER);
+
+statement ok
+INSERT INTO ducklake.not_null_after_update VALUES (NULL), (1);
+
+statement ok
+UPDATE ducklake.not_null_after_update SET i = 2 WHERE i IS NULL;
+
+query I
+SELECT count(*) FROM ducklake.not_null_after_update WHERE i IS NULL;
+----
+0
+
+statement ok
+ALTER TABLE ducklake.not_null_after_update ALTER i SET NOT NULL;
+
+statement error
+INSERT INTO ducklake.not_null_after_update VALUES (NULL);
+----
+NOT NULL constraint failed
+
+# Conversely, updating a non-NULL row to NULL must block SET NOT NULL even though
+# the original insert-time stats had no NULLs.
+statement ok
+CREATE TABLE ducklake.not_null_update_introduces_null(i INTEGER);
+
+statement ok
+INSERT INTO ducklake.not_null_update_introduces_null VALUES (1), (2);
+
+statement ok
+UPDATE ducklake.not_null_update_introduces_null SET i = NULL WHERE i = 1;
+
+statement error
+ALTER TABLE ducklake.not_null_update_introduces_null ALTER i SET NOT NULL;
+----
+has NULL values
+
+# Transaction-local UPDATE that removes the NULL rows should also be visible.
+statement ok
+CREATE TABLE ducklake.not_null_after_update_transaction(i INTEGER);
+
+statement ok
+INSERT INTO ducklake.not_null_after_update_transaction VALUES (NULL), (1);
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE ducklake.not_null_after_update_transaction SET i = 2 WHERE i IS NULL;
+
+statement ok
+ALTER TABLE ducklake.not_null_after_update_transaction ALTER i SET NOT NULL;
+
+statement ok
+COMMIT;
+
+statement error
+INSERT INTO ducklake.not_null_after_update_transaction VALUES (NULL);
+----
+NOT NULL constraint failed
+
+# Unknown NULL statistics must not bypass validation of the live rows.
+statement ok
+CREATE TABLE ducklake.unknown_null_stats(i INTEGER, j INTEGER);
+
+statement ok
+INSERT INTO ducklake.unknown_null_stats VALUES (NULL, 1), (2, 3);
+
+statement ok
+UPDATE __ducklake_metadata_ducklake.ducklake_table_column_stats
+SET contains_null = NULL
+WHERE table_id = (SELECT table_id FROM __ducklake_metadata_ducklake.ducklake_table WHERE table_name = 'unknown_null_stats');
+
+# Reattach so validation reads the unknown statistics instead of cached values.
+statement ok
+DETACH ducklake;
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/ducklake_not_null_files');
+
+statement error
+ALTER TABLE ducklake.unknown_null_stats ALTER i SET NOT NULL;
+----
+has NULL values
+
+statement ok
+ALTER TABLE ducklake.unknown_null_stats ALTER j SET NOT NULL;
+
+statement error
+INSERT INTO ducklake.unknown_null_stats VALUES (4, NULL);
+----
+NOT NULL constraint failed

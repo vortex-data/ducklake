@@ -1,5 +1,9 @@
 name: DBMS Catalog Tests
-on: [push, pull_request, repository_dispatch]
+on:
+  push:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  repository_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
   cancel-in-progress: true
@@ -9,8 +13,9 @@ defaults:
 
 jobs:
   ducklake-config-tests:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: DuckDB Tests with DuckLake + (Postgres/SQLite)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         arch: ['linux_amd64']
@@ -25,13 +30,15 @@ jobs:
       VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
       ENABLE_SQLITE_SCANNER: ON
       ENABLE_POSTGRES_SCANNER: ON
+      ENABLE_QUACK: ON
       BUILD_EXTENSION_TEST_DEPS: full
+      DUCKLAKE_CI: 1
 
     steps:
     - name: Install required ubuntu packages
       run: |
         sudo apt-get update -y -qq
-        sudo apt-get install -y -qq build-essential cmake ninja-build ccache python3
+        sudo apt-get install -y -qq build-essential cmake ninja-build ccache python3 mold
 
     - name: Setup PostgreSQL for Linux/macOS/Windows
       uses: ikalnytskyi/action-setup-postgres@v7
@@ -62,7 +69,7 @@ jobs:
     - name: Setup vcpkg
       uses: lukka/run-vcpkg@v11.1
       with:
-        vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
+        vcpkgGitCommitId: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3 # Release 2026.06.24
 
     - name: Build extension
       env:
@@ -70,19 +77,21 @@ jobs:
       run: |
         make release
 
+    - name: Test Quack
+      run: |
+        python3 scripts/run_quack_tests.py --timeout 300
+
     - name: Test SQLite
+      env:
+        DUCKDB_TPCH_ANSWERS_DIR: ${{ github.workspace }}/duckdb/extension/tpch/dbgen/answers
       run: |
         build/release/test/unittest --test-config test/configs/sqlite.json --test-dir ./ "test/sql/*"
 
     - name: Test Postgres
       env:
         PGSERVICE: postgres
+        LOCAL_EXTENSION_REPO: ${{ github.workspace }}/build/release/repository
+        DUCKDB_TPCH_ANSWERS_DIR: ${{ github.workspace }}/duckdb/extension/tpch/dbgen/answers
       run: |
-        # Pre-install postgres_scanner so LOAD finds it without autoloading
-        # (autoloading is disabled to prevent loading wrong ducklake version)
-        REPO_DIR="build/release/repository/$(cat .github/duckdb-version)/${{ matrix.arch }}"
-        EXT_DIR="$HOME/.duckdb/extensions/$(cat .github/duckdb-version)/${{ matrix.arch }}"
-        mkdir -p "$EXT_DIR"
-        cp "$REPO_DIR/postgres_scanner.duckdb_extension" "$EXT_DIR/"
         createdb ducklakedb
         build/release/test/unittest --test-config test/configs/postgres.json --test-dir ./ "test/sql/*"

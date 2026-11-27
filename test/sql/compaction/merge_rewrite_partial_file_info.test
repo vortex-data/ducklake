@@ -6,13 +6,13 @@ require ducklake
 
 require parquet
 
-test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
 
-test-env DATA_PATH __TEST_DIR__
+test-env DATA_PATH {TEST_DIR}
 
 
 statement ok
-ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/reproduce_issue/')
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/reproduce_issue/')
 
 statement ok
 USE ducklake;
@@ -65,7 +65,10 @@ SELECT COUNT(*) FROM ducklake_list_files('ducklake', 't');
 # Capture expected partial_max before merge: max begin_snapshot of the small files (B and C)
 # (exclude file A which has the smallest begin_snapshot and won't be merged)
 statement ok
-SET VARIABLE expected_pm_1 = (SELECT max(begin_snapshot) FROM __ducklake_metadata_ducklake.ducklake_data_file WHERE end_snapshot IS NULL AND begin_snapshot != (SELECT min(begin_snapshot) FROM __ducklake_metadata_ducklake.ducklake_data_file WHERE end_snapshot IS NULL));
+SET VARIABLE min_begin = (SELECT min(snapshot_id) FROM (SELECT data_file_id, MAX(CASE WHEN is_delete = FALSE THEN snapshot_id END) AS snapshot_id FROM __ducklake_metadata_ducklake.ducklake_file_visibility WHERE branch_id = 0 GROUP BY data_file_id HAVING MAX(CASE WHEN is_delete = TRUE THEN 1 ELSE 0 END) = 0));
+
+statement ok
+SET VARIABLE expected_pm_1 = (SELECT max(snapshot_id) FROM (SELECT data_file_id, MAX(CASE WHEN is_delete = FALSE THEN snapshot_id END) AS snapshot_id FROM __ducklake_metadata_ducklake.ducklake_file_visibility WHERE branch_id = 0 GROUP BY data_file_id HAVING MAX(CASE WHEN is_delete = TRUE THEN 1 ELSE 0 END) = 0) WHERE snapshot_id != getvariable('min_begin'));
 
 # Merge B+C into a single file (A is too big to merge)
 query III
@@ -87,7 +90,7 @@ SELECT COUNT(*) FROM ducklake_list_files('ducklake', 't') WHERE delete_file IS N
 # Only merged BC has partial_max - verify it equals expected value
 query I
 SELECT CASE WHEN partial_max IS NULL THEN NULL ELSE partial_max = getvariable('expected_pm_1') END
-FROM __ducklake_metadata_ducklake.ducklake_data_file WHERE end_snapshot IS NULL ORDER BY data_file_id;
+FROM (SELECT f.*, v.begin_snapshot, v.end_snapshot FROM __ducklake_metadata_ducklake.ducklake_data_file f JOIN (SELECT data_file_id, MAX(CASE WHEN is_delete = FALSE THEN snapshot_id END) begin_snapshot, MAX(CASE WHEN is_delete = TRUE THEN snapshot_id END) end_snapshot FROM __ducklake_metadata_ducklake.ducklake_file_visibility WHERE branch_id = 0 GROUP BY data_file_id) v ON v.data_file_id = f.data_file_id) WHERE end_snapshot IS NULL ORDER BY data_file_id;
 ----
 NULL
 true
@@ -112,14 +115,14 @@ SET VARIABLE snap_E = (SELECT MAX(snapshot_id) FROM ducklake_snapshots('ducklake
 
 # Set small target file size so only D & E get merged
 statement ok
-CALL ducklake_set_option('ducklake', 'target_file_size', '1KB');
+CALL ducklake_set_option('ducklake', 'target_file_size', '1.5KB');
 
 # Capture expected partial_max for D+E merge: max begin_snapshot of files created after the first merge
 statement ok
 SET VARIABLE merge1_snap = (SELECT max(snapshot_id) FROM ducklake_snapshots('ducklake') WHERE changes::VARCHAR LIKE '%merge%');
 
 statement ok
-SET VARIABLE expected_pm_2 = (SELECT max(begin_snapshot) FROM __ducklake_metadata_ducklake.ducklake_data_file WHERE end_snapshot IS NULL AND begin_snapshot > getvariable('merge1_snap'));
+SET VARIABLE expected_pm_2 = (SELECT max(snapshot_id) FROM (SELECT data_file_id, MAX(CASE WHEN is_delete = FALSE THEN snapshot_id END) AS snapshot_id FROM __ducklake_metadata_ducklake.ducklake_file_visibility WHERE branch_id = 0 GROUP BY data_file_id HAVING MAX(CASE WHEN is_delete = TRUE THEN 1 ELSE 0 END) = 0) WHERE snapshot_id > getvariable('merge1_snap'));
 
 # Merge D+E into a single file (A is too big to merge)
 query III
@@ -145,7 +148,7 @@ SELECT CASE WHEN partial_max IS NULL THEN NULL
   WHEN partial_max = getvariable('expected_pm_2') THEN true
   ELSE false
 END
-FROM __ducklake_metadata_ducklake.ducklake_data_file WHERE end_snapshot IS NULL ORDER BY data_file_id;
+FROM (SELECT f.*, v.begin_snapshot, v.end_snapshot FROM __ducklake_metadata_ducklake.ducklake_data_file f JOIN (SELECT data_file_id, MAX(CASE WHEN is_delete = FALSE THEN snapshot_id END) begin_snapshot, MAX(CASE WHEN is_delete = TRUE THEN snapshot_id END) end_snapshot FROM __ducklake_metadata_ducklake.ducklake_file_visibility WHERE branch_id = 0 GROUP BY data_file_id) v ON v.data_file_id = f.data_file_id) WHERE end_snapshot IS NULL ORDER BY data_file_id;
 ----
 NULL
 true

@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/common/multi_file/base_file_reader.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 
@@ -40,6 +41,8 @@ public:
 
 private:
 	static TableFunction GetReadFunction(ClientContext &context, const string &format);
+	bool TryEvaluateExpression(ClientContext &context, idx_t virtual_col_idx, Vector &input_vector,
+	                           const LogicalType &input_type, idx_t count, Vector &output_vector);
 
 	mutex lock;
 	DuckLakeFunctionInfo &read_info;
@@ -51,7 +54,7 @@ private:
 	TableFunction file_scan;
 	unique_ptr<FunctionData> bind_data;
 	vector<LogicalType> file_types;
-	vector<string> file_names;
+	vector<Identifier> file_names;
 
 	unique_ptr<ThreadContext> thread_context;
 	unique_ptr<ExecutionContext> execution_context;
@@ -62,6 +65,8 @@ private:
 	DataChunk scan_chunk;                          //! raw columns read from the file
 	vector<FormatReaderColumn> output_kinds;       //! how each output column is produced
 	vector<idx_t> output_source_index;             //! for FILE_COLUMN: position in scan_chunk
+	//! Expression executors for expression_map entries, keyed by column_t (from column_ids)
+	unordered_map<column_t, unique_ptr<ExpressionExecutor>> expression_executors;
 };
 
 } // namespace duckdb

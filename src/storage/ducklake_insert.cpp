@@ -1,42 +1,75 @@
 #include "storage/ducklake_catalog.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/common/encryption_functions.hpp"
 #include "storage/ducklake_schema_entry.hpp"
 #include "storage/ducklake_field_data.hpp"
 #include "storage/ducklake_insert.hpp"
+#include "duckdb/main/query_result.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "common/ducklake_util.hpp"
+#include "common/parquet_file_scanner.hpp"
 #include "storage/ducklake_scan.hpp"
 #include "storage/ducklake_inline_data.hpp"
 #include "storage/ducklake_geo_stats.hpp"
 #include "common/ducklake_types.hpp"
+#include "functions/ducklake_compaction_functions.hpp"
 
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
+#include "duckdb/common/bind_helpers.hpp"
+#include "duckdb/execution/column_binding_resolver.hpp"
+#include "duckdb/execution/operator/join/physical_join.hpp"
+#include "duckdb/execution/operator/order/physical_order.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
-#include "duckdb/main/extension_helper.hpp"
 #include "duckdb/function/function_binder.hpp"
-#include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/main/client_context_state.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "storage/ducklake_variant_stats.hpp"
 
 namespace duckdb {
 
+//! The partition id that data files written under this spec carry (invalid when the table is not partitioned)
+static optional_idx GetPartitionId(optional_ptr<DuckLakePartition> partition_data) {
+	optional_idx result;
+	if (partition_data && !partition_data->fields.empty()) {
+		result = partition_data->partition_id;
+	}
+	return result;
+}
+
 DuckLakeInsert::DuckLakeInsert(PhysicalPlan &physical_plan, const vector<LogicalType> &types, DuckLakeTableEntry &table,
-                               optional_idx partition_id, string encryption_key_p)
+                               optional_idx partition_id_p, string encryption_key_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, types, 1), table(&table), schema(nullptr),
-      partition_id(partition_id), encryption_key(std::move(encryption_key_p)) {
+      partition_id(partition_id_p), encryption_key(std::move(encryption_key_p)) {
 }
 
 DuckLakeInsert::DuckLakeInsert(PhysicalPlan &physical_plan, const vector<LogicalType> &types,
                                SchemaCatalogEntry &schema, unique_ptr<BoundCreateTableInfo> info, string table_uuid_p,
-                               string table_data_path_p, string encryption_key_p)
+                               string table_data_path_p, unique_ptr<DuckLakePartition> ctas_partition_data_p,
+                               unique_ptr<DuckLakeSort> ctas_sort_data_p, map<string, string> ctas_table_options_p,
+                               string encryption_key_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, types, 1), table(nullptr), schema(&schema),
       info(std::move(info)), table_uuid(std::move(table_uuid_p)), table_data_path(std::move(table_data_path_p)),
+      ctas_partition_data(std::move(ctas_partition_data_p)), ctas_sort_data(std::move(ctas_sort_data_p)),
+      ctas_table_options(std::move(ctas_table_options_p)), partition_id(GetPartitionId(ctas_partition_data)),
       encryption_key(std::move(encryption_key_p)) {
 }
 
@@ -47,19 +80,26 @@ DuckLakeInsertGlobalState::DuckLakeInsertGlobalState(DuckLakeTableEntry &table)
     : table(table), total_insert_count(0), not_null_fields(table.GetNotNullFields()) {
 	// record written files with the same format GetCopyOptions writes them in
 	auto &catalog = table.ParentCatalog().Cast<DuckLakeCatalog>();
-	catalog.TryGetConfigOption("data_file_format", file_format, table);
+	auto schema_id = table.ParentSchema().Cast<DuckLakeSchemaEntry>().GetSchemaId();
+	catalog.TryGetConfigOption("data_file_format", file_format, schema_id, table.GetTableId(),
+	                           &table.GetTableOptions());
 	file_format = DuckLakeInsert::ValidateDataFileFormat(file_format);
 }
 
 unique_ptr<GlobalSinkState> DuckLakeInsert::GetGlobalSinkState(ClientContext &context) const {
 	optional_ptr<DuckLakeTableEntry> table_ptr;
 	if (info) {
-		// CREATE TABLE AS - create the table
+		// CTAS: materialize the table entry, cloning the prebuilt spec so the operator's copy survives re-execution.
+		auto partition_clone = ctas_partition_data ? make_uniq<DuckLakePartition>(*ctas_partition_data) : nullptr;
+		auto sort_clone = ctas_sort_data ? make_uniq<DuckLakeSort>(*ctas_sort_data) : nullptr;
+
 		auto &catalog = schema->catalog;
 		auto &ducklake_schema = schema.get_mutable()->Cast<DuckLakeSchemaEntry>();
 		auto transaction = catalog.GetCatalogTransaction(context);
-		table_ptr = &ducklake_schema.CreateTableExtended(transaction, *info, table_uuid, table_data_path)
-		                 ->Cast<DuckLakeTableEntry>();
+		auto created =
+		    ducklake_schema.CreateTableExtended(transaction, *info, table_uuid, table_data_path,
+		                                        std::move(partition_clone), std::move(sort_clone), ctas_table_options);
+		table_ptr = &created->Cast<DuckLakeTableEntry>();
 	} else {
 		// INSERT INTO
 		table_ptr = table;
@@ -96,6 +136,13 @@ DuckLakeColumnStats DuckLakeInsert::ParseColumnStats(const LogicalType &type, co
 		} else if (stats_name == "has_nan") {
 			column_stats.has_contains_nan = true;
 			column_stats.contains_nan = StringValue::Get(stats_children[1]) == "true";
+		} else if (stats_name == "min_is_exact") {
+			column_stats.min_is_exact = StringValue::Get(stats_children[1]) == "true";
+		} else if (stats_name == "max_is_exact") {
+			column_stats.max_is_exact = StringValue::Get(stats_children[1]) == "true";
+		} else if (stats_name == "nan_count") {
+			// NaN count of floating point columns; contains_nan is already set from has_nan
+			continue;
 		} else if (column_stats.extra_stats && column_stats.extra_stats->ParseStats(stats_name, stats_children)) {
 			// handled by extra stats
 			continue;
@@ -104,6 +151,16 @@ DuckLakeColumnStats DuckLakeInsert::ParseColumnStats(const LogicalType &type, co
 		}
 	}
 	return column_stats;
+}
+
+static bool IsLeafColumnStats(const vector<Value> &col_stats) {
+	// only leaf columns report a size
+	for (auto &stat : col_stats) {
+		if (StringValue::Get(StructValue::GetChildren(stat)[0]) == "column_size_bytes") {
+			return true;
+		}
+	}
+	return false;
 }
 
 void DuckLakeInsert::AddWrittenFiles(ClientContext &context, DuckLakeInsertGlobalState &global_state, DataChunk &chunk,
@@ -141,6 +198,10 @@ void DuckLakeInsert::AddWrittenFiles(ClientContext &context, DuckLakeInsertGloba
 		}
 		return;
 	}
+	auto skipped_fields = global_state.table.GetSkippedStatsFields();
+	auto &field_data = global_state.table.GetFieldData();
+	auto snapshot_id_name = InternalColumnName(field_data, "_ducklake_internal_snapshot_id");
+	auto row_id_name = InternalColumnName(field_data, "_ducklake_internal_row_id");
 	for (idx_t r = 0; r < chunk.size(); r++) {
 		DuckLakeDataFile data_file;
 		data_file.file_name = chunk.GetValue(0, r).GetValue<string>();
@@ -148,6 +209,18 @@ void DuckLakeInsert::AddWrittenFiles(ClientContext &context, DuckLakeInsertGloba
 		data_file.row_count = chunk.GetValue(1, r).GetValue<idx_t>();
 		data_file.file_size_bytes = chunk.GetValue(2, r).GetValue<idx_t>();
 		data_file.footer_size = chunk.GetValue(3, r).GetValue<idx_t>();
+		if (chunk.ColumnCount() > 6) {
+			auto extra_info = chunk.GetValue(6, r);
+			if (!extra_info.IsNull()) {
+				for (auto &extra_entry : MapValue::GetChildren(extra_info)) {
+					auto &entry_children = StructValue::GetChildren(extra_entry);
+					if (StringValue::Get(entry_children[0]) == "row_group_count" && !entry_children[1].IsNull()) {
+						data_file.row_group_count =
+						    entry_children[1].DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>();
+					}
+				}
+			}
+		}
 		data_file.encryption_key = encryption_key;
 		if (partition_id.IsValid()) {
 			data_file.partition_id = partition_id.GetIndex();
@@ -162,9 +235,11 @@ void DuckLakeInsert::AddWrittenFiles(ClientContext &context, DuckLakeInsertGloba
 			auto &struct_children = StructValue::GetChildren(map_children[col_idx]);
 			auto &col_name = StringValue::Get(struct_children[0]);
 			auto &col_stats = MapValue::GetChildren(struct_children[1]);
+			if (!IsLeafColumnStats(col_stats)) {
+				continue;
+			}
 			auto column_names = DuckLakeUtil::ParseQuotedList(col_name, '.');
-			// FIXME: this should be checked differently
-			if (column_names[0] == "_ducklake_internal_snapshot_id") {
+			if (column_names.size() == 1 && column_names[0] == snapshot_id_name) {
 				if (set_snapshot_id) {
 					// set start snapshot id based on the minimum written to the file
 					auto snapshot_stats = ParseColumnStats(LogicalType::UBIGINT, col_stats);
@@ -177,7 +252,7 @@ void DuckLakeInsert::AddWrittenFiles(ClientContext &context, DuckLakeInsertGloba
 				}
 				continue;
 			}
-			if (column_names[0] == "_ducklake_internal_row_id") {
+			if (column_names.size() == 1 && column_names[0] == row_id_name) {
 				if (set_snapshot_id) {
 					// extract the min row_id so flushed files preserve the original row_id_start
 					auto row_id_stats = ParseColumnStats(LogicalType::BIGINT, col_stats);
@@ -189,7 +264,7 @@ void DuckLakeInsert::AddWrittenFiles(ClientContext &context, DuckLakeInsertGloba
 			}
 
 			optional_idx name_offset;
-			auto &field_id = table.GetFieldId(column_names, &name_offset);
+			auto &field_id = table.GetFieldId(StringsToIdentifiers(column_names), &name_offset);
 			if (name_offset.IsValid()) {
 				if (field_id.Type().id() != LogicalTypeId::VARIANT) {
 					throw InternalException("name_offset can only be set for variant columns");
@@ -209,18 +284,26 @@ void DuckLakeInsert::AddWrittenFiles(ClientContext &context, DuckLakeInsertGloba
 				throw InvalidInputException("Top-level variant cannot have stats");
 			}
 			auto column_stats = ParseColumnStats(field_id.Type(), col_stats);
+			if (data_file.row_count > 0 && column_stats.has_num_values && column_stats.num_values == 0) {
+				// the writer only counts the values of columns it collects statistics for
+				column_stats.has_num_values = false;
+				column_stats.has_null_count = false;
+			}
 			if (column_stats.null_count > 0 && column_names.size() == 1) {
 				// we wrote NULL values to a base column - verify NOT NULL constraint
-				if (global_state.not_null_fields.count(column_names[0])) {
-					throw ConstraintException("NOT NULL constraint failed: %s.%s", table.name, column_names[0]);
+				Identifier column_name(column_names[0]);
+				if (global_state.not_null_fields.count(column_name)) {
+					table.ThrowNotNullViolation(column_name);
 				}
 			}
 
+			if (skipped_fields.count(field_id.GetFieldIndex().index)) {
+				column_stats.ClearBounds();
+			}
 			data_file.column_stats.insert(make_pair(field_id.GetFieldIndex(), std::move(column_stats)));
 		}
 		// finalize variant stats
 		for (auto &entry : variant_stats) {
-			// FIXME: verify NOT NULL constraints for variants
 			data_file.column_stats.insert(make_pair(entry.first, entry.second.Finalize()));
 		}
 		// extract the partition info
@@ -236,10 +319,11 @@ void DuckLakeInsert::AddWrittenFiles(ClientContext &context, DuckLakeInsertGloba
 				data_file.partition_values.push_back(std::move(file_partition_info));
 			}
 		}
+		if (data_file.row_count == 0) {
+			global_state.empty_files.push_back(std::move(data_file.file_name));
+			continue;
+		}
 		if (set_snapshot_id && !data_file.begin_snapshot.IsValid()) {
-			if (data_file.row_count == 0) {
-				continue;
-			}
 			throw InvalidInputException("Did not find written snapshot id - but operation requires it to be set");
 		}
 
@@ -260,22 +344,36 @@ SourceResultType DuckLakeInsert::GetDataInternal(ExecutionContext &context, Data
                                                  OperatorSourceInput &input) const {
 	auto &global_state = sink_state->Cast<DuckLakeInsertGlobalState>();
 	auto value = Value::BIGINT(NumericCast<int64_t>(global_state.total_insert_count));
-	chunk.SetCardinality(1);
-	chunk.SetValue(0, 0, value);
+	chunk.data[0].Append(value);
+	chunk.SetChildCardinality(1);
 	return SourceResultType::FINISHED;
 }
 //===--------------------------------------------------------------------===//
 // Finalize
 //===--------------------------------------------------------------------===//
+void DuckLakeInsert::RemoveEmptyFiles(ClientContext &context, DuckLakeInsertGlobalState &gstate) {
+	if (gstate.empty_files.empty()) {
+		return;
+	}
+	auto &fs = FileSystem::GetFileSystem(context);
+	fs.RemoveFiles(gstate.empty_files);
+	gstate.empty_files.clear();
+}
+
 SinkFinalizeType DuckLakeInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                           OperatorSinkFinalizeInput &input) const {
 	auto &global_state = input.global_state.Cast<DuckLakeInsertGlobalState>();
 
+	RemoveEmptyFiles(context, global_state);
 	for (auto &data_file : global_state.written_files) {
 		global_state.total_insert_count += data_file.row_count;
 	}
 	auto &transaction = DuckLakeTransaction::Get(context, global_state.table.catalog);
 	transaction.AppendFiles(global_state.table.GetTableId(), std::move(global_state.written_files));
+	if (reads_table) {
+		// a concurrent insert could have produced rows that would have changed what we inserted
+		transaction.MarkDeleteAttempted(global_state.table.GetTableId());
+	}
 
 	return SinkFinalizeType::READY;
 }
@@ -289,31 +387,23 @@ string DuckLakeInsert::GetName() const {
 
 InsertionOrderPreservingMap<string> DuckLakeInsert::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
-	result["Table Name"] = table ? table->name : info->Base().table;
+	result["Table Name"] = (table ? table->name : info->Base().GetTableName()).GetIdentifierName();
 	return result;
 }
 
 //===--------------------------------------------------------------------===//
 // Plan
 //===--------------------------------------------------------------------===//
-CopyFunctionCatalogEntry &DuckLakeFunctions::GetCopyFunction(ClientContext &context, const string &name) {
-	// Logic is partially duplicated from Catalog::AutoLoadExtensionByCatalogEntry(db, CatalogType::COPY_FUNCTION_ENTRY,
-	// name), but that do not offer enough control
-	auto &db = *context.db;
-	string extension_name = ExtensionHelper::FindExtensionInEntries(name, EXTENSION_COPY_FUNCTIONS);
-	if (!extension_name.empty() && Settings::Get<AutoloadKnownExtensionsSetting>(context) &&
-	    ExtensionHelper::CanAutoloadExtension(extension_name)) {
-		// This will either succeed or throw
-		ExtensionHelper::AutoLoadExtension(db, extension_name);
-	}
+CopyFunctionCatalogEntry &DuckLakeFunctions::GetCopyFunction(ClientContext &context, const Identifier &name) {
 	D_ASSERT(!name.empty());
-	auto &system_catalog = Catalog::GetSystemCatalog(db);
+	auto &system_catalog = Catalog::GetSystemCatalog(context);
 
-	auto entry =
-	    system_catalog.GetEntry<CopyFunctionCatalogEntry>(context, DEFAULT_SCHEMA, name, OnEntryNotFound::RETURN_NULL);
+	auto entry = system_catalog.GetEntry<CopyFunctionCatalogEntry>(
+	    context, QualifiedName(system_catalog.GetName(), Identifier::DefaultSchema(), name),
+	    OnEntryNotFound::RETURN_NULL);
 	if (!entry) {
 		throw MissingExtensionException(
-		    "Could not load the copy function for \"%s\". Try explicitly loading the \"%s\" extension", name, name);
+		    "Could not load the copy function for %s. Try explicitly loading the %s extension", name, name);
 	}
 	return *entry;
 }
@@ -339,8 +429,18 @@ static bool WriteRowId(InsertVirtualColumns virtual_columns) {
 }
 
 static bool WriteSnapshotId(InsertVirtualColumns virtual_columns) {
-	return virtual_columns == InsertVirtualColumns::WRITE_SNAPSHOT_ID ||
-	       virtual_columns == InsertVirtualColumns::WRITE_ROW_ID_AND_SNAPSHOT_ID;
+	return virtual_columns == InsertVirtualColumns::WRITE_ROW_ID_AND_SNAPSHOT_ID;
+}
+
+Identifier DuckLakeInsert::InternalColumnName(const DuckLakeFieldData &field_data, const Identifier &name) {
+	vector<Identifier> names;
+	for (auto &field_id : field_data.GetFieldIds()) {
+		names.push_back(field_id->Name());
+	}
+	// the reader finds internal columns by field id, so their name in the file only has to be unique
+	names.push_back(name);
+	QueryResult::DeduplicateColumns(names);
+	return names.back();
 }
 
 static Value WrittenFieldIds(DuckLakeFieldData &field_data, InsertVirtualColumns virtual_columns) {
@@ -350,17 +450,14 @@ static Value WrittenFieldIds(DuckLakeFieldData &field_data, InsertVirtualColumns
 		values.emplace_back(field_id.Name(), GetFieldIdValue(field_id));
 	}
 	if (WriteRowId(virtual_columns)) {
-		values.emplace_back("_ducklake_internal_row_id", Value::BIGINT(MultiFileReader::ROW_ID_FIELD_ID));
+		values.emplace_back(DuckLakeInsert::InternalColumnName(field_data, "_ducklake_internal_row_id"),
+		                    Value::BIGINT(MultiFileReader::ROW_ID_FIELD_ID));
 	}
 	if (WriteSnapshotId(virtual_columns)) {
-		values.emplace_back("_ducklake_internal_snapshot_id",
+		values.emplace_back(DuckLakeInsert::InternalColumnName(field_data, "_ducklake_internal_snapshot_id"),
 		                    Value::BIGINT(MultiFileReader::LAST_UPDATED_SEQUENCE_NUMBER_ID));
 	}
 	return Value::STRUCT(std::move(values));
-}
-
-DuckLakeCopyOptions::DuckLakeCopyOptions(unique_ptr<CopyInfo> info_p, CopyFunction copy_function_p)
-    : info(std::move(info_p)), copy_function(std::move(copy_function_p)) {
 }
 
 DuckLakeCopyInput::DuckLakeCopyInput(ClientContext &context, DuckLakeTableEntry &table, const string &hive_partition)
@@ -370,23 +467,19 @@ DuckLakeCopyInput::DuckLakeCopyInput(ClientContext &context, DuckLakeTableEntry 
 	field_data = table.GetFieldData();
 	schema_id = table.ParentSchema().Cast<DuckLakeSchemaEntry>().GetSchemaId();
 	table_id = table.GetTableId();
+	table_options = table.GetTableOptions();
 	encryption_key = catalog.GenerateEncryptionKey(context);
 	has_not_null_columns = !table.GetNotNullFields().empty();
 }
 
 DuckLakeCopyInput::DuckLakeCopyInput(ClientContext &context, DuckLakeSchemaEntry &schema, const ColumnList &columns,
-                                     const string &data_path_p)
+                                     const string &data_path_p, DuckLakeFieldData &field_data_p,
+                                     optional_ptr<DuckLakePartition> partition_data_p)
     : catalog(schema.ParentCatalog().Cast<DuckLakeCatalog>()), columns(columns), data_path(data_path_p) {
+	field_data = &field_data_p;
+	partition_data = partition_data_p;
 	schema_id = schema.GetSchemaId();
 	encryption_key = catalog.GenerateEncryptionKey(context);
-}
-
-static void StripTrailingSeparator(FileSystem &fs, string &path) {
-	auto sep = fs.PathSeparator(path);
-	if (!StringUtil::EndsWith(path, sep)) {
-		return;
-	}
-	path = path.substr(0, path.size() - sep.size());
 }
 
 const DuckLakeFieldId &DuckLakeInsert::GetTopLevelColumn(DuckLakeCopyInput &copy_input, FieldIndex field_id,
@@ -412,7 +505,7 @@ static unique_ptr<Expression> CreateColumnReference(DuckLakeCopyInput &copy_inpu
                                                     idx_t column_index) {
 	if (copy_input.get_table_index.IsValid()) {
 		// logical plan generation: generate a bound column ref
-		ColumnBinding column_binding(copy_input.get_table_index.GetIndex(), column_index);
+		ColumnBinding column_binding(TableIndex(copy_input.get_table_index.GetIndex()), ProjectionIndex(column_index));
 		return make_uniq<BoundColumnRefExpression>(type, column_binding);
 	}
 	// physical plan generation: generate a reference directly
@@ -425,42 +518,10 @@ static unique_ptr<Expression> GetColumnReference(DuckLakeCopyInput &copy_input, 
 	return CreateColumnReference(copy_input, column_field_id.Type(), index.GetIndex());
 }
 
-static unique_ptr<Expression> GetFunction(ClientContext &context, DuckLakeCopyInput &copy_input,
-                                          const string &function_name, FieldIndex field_id) {
-	vector<unique_ptr<Expression>> children;
-	children.push_back(GetColumnReference(copy_input, field_id));
-
-	ErrorData error;
-	FunctionBinder binder(context);
-	auto function = binder.BindScalarFunction(DEFAULT_SCHEMA, function_name, std::move(children), error, false);
-	if (!function) {
-		error.Throw();
-	}
-	return function;
-}
-
 static unique_ptr<Expression> GetPartitionExpression(ClientContext &context, DuckLakeCopyInput &copy_input,
                                                      const DuckLakePartitionField &field) {
-	switch (field.transform.type) {
-	case DuckLakeTransformType::IDENTITY:
-		return GetColumnReference(copy_input, field.field_id);
-	case DuckLakeTransformType::YEAR:
-		return GetFunction(context, copy_input, "year", field.field_id);
-	case DuckLakeTransformType::MONTH:
-		return GetFunction(context, copy_input, "month", field.field_id);
-	case DuckLakeTransformType::DAY:
-		return GetFunction(context, copy_input, "day", field.field_id);
-	case DuckLakeTransformType::HOUR:
-		return GetFunction(context, copy_input, "hour", field.field_id);
-	default:
-		throw NotImplementedException("Unsupported partition transform type in GetPartitionExpression");
-	}
-}
-
-static string GetPartitionExpressionName(DuckLakeCopyInput &copy_input, const DuckLakePartitionField &field,
-                                         case_insensitive_set_t &names) {
-	auto field_id = copy_input.field_data->GetByFieldIndex(field.field_id);
-	return DuckLakePartitionUtils::GetPartitionKeyName(field.transform.type, field_id->Name(), names);
+	auto column_expr = GetColumnReference(copy_input, field.field_id);
+	return DuckLakePartitionUtils::ApplyPartitionTransform(context, std::move(column_expr), field);
 }
 
 static void GeneratePartitionExpressions(ClientContext &context, DuckLakeCopyInput &copy_input,
@@ -478,29 +539,18 @@ static void GeneratePartitionExpressions(ClientContext &context, DuckLakeCopyInp
 		for (auto &field : copy_input.partition_data->fields) {
 			optional_idx col_idx;
 			DuckLakeInsert::GetTopLevelColumn(copy_input, field.field_id, col_idx);
-			copy_options.partition_columns.push_back(col_idx.GetIndex());
+			copy_options.copy->partition_columns.push_back(col_idx.GetIndex());
 		}
 		return;
 	}
-	idx_t virtual_column_count;
-	switch (copy_input.virtual_columns) {
-	case InsertVirtualColumns::WRITE_ROW_ID:
-	case InsertVirtualColumns::WRITE_SNAPSHOT_ID:
-		virtual_column_count = 1;
-		break;
-	case InsertVirtualColumns::WRITE_ROW_ID_AND_SNAPSHOT_ID:
-		virtual_column_count = 2;
-		break;
-	default:
-		virtual_column_count = 0;
-		break;
-	}
+	idx_t virtual_column_count = static_cast<idx_t>(WriteRowId(copy_input.virtual_columns)) +
+	                             static_cast<idx_t>(WriteSnapshotId(copy_input.virtual_columns));
 	// if we have partition columns that are NOT identity, we need to compute them separately, and NOT write them
 	idx_t partition_column_start = copy_input.columns.PhysicalColumnCount() + virtual_column_count;
 	for (idx_t part_idx = 0; part_idx < copy_input.partition_data->fields.size(); part_idx++) {
-		copy_options.partition_columns.push_back(partition_column_start++);
+		copy_options.copy->partition_columns.push_back(partition_column_start++);
 	}
-	copy_options.write_partition_columns = false;
+	copy_options.copy->write_partition_columns = false;
 
 	idx_t col_idx = 0;
 	for (auto &col : copy_input.columns.Physical()) {
@@ -511,12 +561,12 @@ static void GeneratePartitionExpressions(ClientContext &context, DuckLakeCopyInp
 		copy_options.projection_list.push_back(CreateColumnReference(copy_input, LogicalType::BIGINT, col_idx++));
 	}
 	// push the partition expressions
-	case_insensitive_set_t names;
-	for (auto &field : copy_input.partition_data->fields) {
-		auto expr = GetPartitionExpression(context, copy_input, field);
-		copy_options.names.push_back(GetPartitionExpressionName(copy_input, field, names));
-		names.insert(copy_options.names.back());
-		copy_options.expected_types.push_back(expr->return_type);
+	auto &fields = copy_input.partition_data->fields;
+	auto key_names = DuckLakePartitionUtils::GetPartitionKeyNames(*copy_input.partition_data, *copy_input.field_data);
+	for (idx_t part_idx = 0; part_idx < fields.size(); part_idx++) {
+		auto expr = GetPartitionExpression(context, copy_input, fields[part_idx]);
+		copy_options.copy->names.push_back(Identifier(key_names[part_idx]));
+		copy_options.copy->expected_types.push_back(expr->GetReturnType());
 		copy_options.projection_list.push_back(std::move(expr));
 	}
 }
@@ -531,33 +581,42 @@ string DuckLakeInsert::ValidateDataFileFormat(string format) {
 	return format;
 }
 
-DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckLakeCopyInput &copy_input) {
+unique_ptr<CopyInfo> DuckLakeInsert::GetParquetCopyInfo(const string &file_path, Value field_ids,
+                                                        const string &encryption_key) {
 	auto info = make_uniq<CopyInfo>();
+	info->file_path = file_path;
+	info->format = "parquet";
+	info->is_from = false;
+	info->options["field_ids"].push_back(std::move(field_ids));
+	if (!encryption_key.empty()) {
+		info->options["encryption_config"].push_back(ParquetFileScanner::EncryptionConfig(encryption_key));
+	}
+	return info;
+}
+
+DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckLakeCopyInput &copy_input) {
 	auto &catalog = copy_input.catalog;
 	auto &schema_id = copy_input.schema_id;
 	auto &table_id = copy_input.table_id;
-	info->file_path = copy_input.data_path;
-	info->is_from = false;
 
 	// Determine the physical file format for this table: parquet (default) or another supported format.
 	string data_file_format = "parquet";
-	catalog.TryGetConfigOption("data_file_format", data_file_format, schema_id, table_id);
+	catalog.TryGetConfigOption("data_file_format", data_file_format, schema_id, table_id, &copy_input.table_options);
 	data_file_format = ValidateDataFileFormat(data_file_format);
 	const bool is_parquet = data_file_format == "parquet";
-	info->format = data_file_format;
 
+	unique_ptr<CopyInfo> info;
 	if (!is_parquet) {
 		// non-parquet writes emit a single file with no per-file column statistics. Reject the cases that
 		// rely on those stats here, before anything is written, so no orphan file is left on disk.
-		if (copy_input.partition_data) {
+		if (GetPartitionId(copy_input.partition_data).IsValid()) {
 			// partition assignment requires one file per partition value + recorded partition_values
 			throw NotImplementedException("Partitioned writes are not yet supported for the '%s' data file format",
 			                              data_file_format);
 		}
 		if (copy_input.is_flush) {
 			// flush of inlined data derives begin_snapshot / row_id_start from the written file's
-			// snapshot_id / row_id column statistics (compaction shares the same virtual columns but
-			// does not need those stats, so it is not blocked here)
+			// snapshot_id / row_id column statistics
 			throw NotImplementedException("Flushing inlined data is not yet supported for the '%s' data file format - "
 			                              "set data_inlining_row_limit to 0 for such tables",
 			                              data_file_format);
@@ -573,59 +632,40 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 			throw NotImplementedException("Compaction is not yet supported for the '%s' data file format",
 			                              data_file_format);
 		}
-	}
-
-	if (is_parquet) {
-		// field ids are parquet-only; non-parquet files are mapped by column name at read time
-		shared_ptr<DuckLakeFieldData> generated_ids;
-		if (!copy_input.field_data) {
-			// CTAS - generate new ids from columns
-			generated_ids = DuckLakeFieldData::FromColumns(copy_input.columns);
-		}
-		auto &field_ids = copy_input.field_data ? *copy_input.field_data : *generated_ids;
-		vector<Value> field_input;
-		field_input.push_back(WrittenFieldIds(field_ids, copy_input.virtual_columns));
-		info->options["field_ids"] = std::move(field_input);
-	}
-	if (!copy_input.encryption_key.empty()) {
-		if (!is_parquet) {
+		if (!copy_input.encryption_key.empty()) {
 			throw NotImplementedException("Encryption is only supported for DuckLake tables written as parquet");
 		}
-		child_list_t<Value> values;
-		values.emplace_back("footer_key_value", Value::BLOB_RAW(copy_input.encryption_key));
-		vector<Value> encryption_input;
-		encryption_input.push_back(Value::STRUCT(std::move(values)));
-		info->options["encryption_config"] = std::move(encryption_input);
-	}
-	if (is_parquet) {
-		string parquet_compression;
-		if (catalog.TryGetConfigOption("parquet_compression", parquet_compression, schema_id, table_id)) {
-			info->options["compression"].emplace_back(parquet_compression);
+		info = make_uniq<CopyInfo>();
+		info->file_path = copy_input.data_path;
+		info->format = data_file_format;
+		info->is_from = false;
+	} else {
+		// generate the field ids to be written by the parquet writer
+		info = GetParquetCopyInfo(copy_input.data_path, WrittenFieldIds(*copy_input.field_data, copy_input.virtual_columns),
+		                          copy_input.encryption_key);
+		static const pair<const char *, const char *> PARQUET_OPTIONS[] = {
+		    {"parquet_compression", "compression"},
+		    {"parquet_version", "parquet_version"},
+		    {"parquet_compression_level", "compression_level"}};
+		for (auto &option : PARQUET_OPTIONS) {
+			string option_value;
+			if (catalog.TryGetConfigOption(option.first, option_value, schema_id, table_id, &copy_input.table_options)) {
+				info->options[option.second].emplace_back(option_value);
+			}
 		}
-		string parquet_version;
-		if (catalog.TryGetConfigOption("parquet_version", parquet_version, schema_id, table_id)) {
-			info->options["parquet_version"].emplace_back(parquet_version);
-		}
-		string parquet_compression_level;
-		if (catalog.TryGetConfigOption("parquet_compression_level", parquet_compression_level, schema_id, table_id)) {
-			info->options["compression_level"].emplace_back(parquet_compression_level);
-		}
-		string row_group_size;
-		if (catalog.TryGetConfigOption("parquet_row_group_size", row_group_size, schema_id, table_id)) {
-			info->options["row_group_size"].emplace_back(row_group_size);
-		}
-		string row_group_size_bytes;
-		if (catalog.TryGetConfigOption("parquet_row_group_size_bytes", row_group_size_bytes, schema_id, table_id)) {
-			info->options["row_group_size_bytes"].emplace_back(row_group_size_bytes + " bytes");
+		// the writer accepts a compression level only for ZSTD, which a table can override
+		auto compression = info->options.find("compression");
+		if (compression == info->options.end() || !StringUtil::CIEquals(compression->second[0].ToString(), "zstd")) {
+			info->options.erase("compression_level");
 		}
 	}
 	string per_thread_output_str;
 	bool per_thread_output = false;
-	if (catalog.TryGetConfigOption("per_thread_output", per_thread_output_str, schema_id, table_id)) {
+	if (catalog.TryGetConfigOption("per_thread_output", per_thread_output_str, schema_id, table_id,
+	                               &copy_input.table_options)) {
 		per_thread_output = per_thread_output_str == "true";
 	}
-	idx_t target_file_size = catalog.GetConfigOption<idx_t>("target_file_size", schema_id, table_id,
-	                                                        DuckLakeCatalog::DEFAULT_TARGET_FILE_SIZE);
+	idx_t target_file_size = catalog.GetTargetFileSize(context, schema_id, table_id, &copy_input.table_options);
 
 	if (is_parquet) {
 		// Always use native parquet geometry for writing
@@ -633,7 +673,7 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 	}
 
 	// Get the copy function for the chosen data file format
-	auto &copy_fun = DuckLakeFunctions::GetCopyFunction(context, data_file_format);
+	auto &copy_fun = DuckLakeFunctions::GetCopyFunction(context, Identifier(data_file_format));
 	if (!copy_fun.function.copy_to_bind) {
 		throw NotImplementedException(
 		    "The '%s' copy function cannot be used to write DuckLake data files (no copy_to_bind support)",
@@ -641,89 +681,92 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 	}
 
 	auto &fs = FileSystem::GetFileSystem(context);
-	if (!fs.IsRemoteFile(copy_input.data_path)) {
-		// create data path if it does not yet exist
-		try {
-			fs.CreateDirectoriesRecursive(copy_input.data_path);
-		} catch (...) {
-		}
-	}
+	DuckLakeUtil::EnsureDirectoryExists(fs, copy_input.data_path);
 
 	// Bind Copy Function
 	CopyFunctionBindInput bind_input(*info);
 
-	auto names_to_write = copy_input.columns.GetColumnNames();
+	auto names_to_write = StringsToIdentifiers(copy_input.columns.GetColumnNames());
 	auto types_to_write = copy_input.columns.GetColumnTypes();
 	if (WriteRowId(copy_input.virtual_columns)) {
-		names_to_write.push_back("_ducklake_internal_row_id");
+		names_to_write.push_back(InternalColumnName(*copy_input.field_data, "_ducklake_internal_row_id"));
 		types_to_write.push_back(LogicalType::BIGINT);
 	}
 	if (WriteSnapshotId(copy_input.virtual_columns)) {
-		names_to_write.push_back("_ducklake_internal_snapshot_id");
+		names_to_write.push_back(InternalColumnName(*copy_input.field_data, "_ducklake_internal_snapshot_id"));
 		types_to_write.push_back(LogicalType::BIGINT);
 	}
 
-	vector<LogicalType> casted_types;
-	for (const auto &type : types_to_write) {
-		if (DuckLakeTypes::RequiresCast(type)) {
-			casted_types.push_back(DuckLakeTypes::GetCastedType(type));
-		} else {
-			casted_types.push_back(type);
+	auto function_data = copy_fun.function.copy_to_bind(context, bind_input, names_to_write, types_to_write);
+
+	DuckLakeCopyOptions result;
+	result.copy =
+	    make_uniq<LogicalCopyToFile>(copy_fun.function, std::move(function_data), std::move(info), TableIndex());
+	auto &copy = *result.copy;
+	copy.use_tmp_file = false;
+	copy.filename_pattern.SetFilenamePattern("ducklake-{uuidv7}");
+	static constexpr idx_t MINIMUM_WRITE_FILE_SIZE = 4096;
+	copy.file_size_bytes = MaxValue<idx_t>(target_file_size, MINIMUM_WRITE_FILE_SIZE);
+	copy.rotate = true;
+	// the batch copy computes with its sizes as BIGINT, and no row group reaches a larger size
+	static constexpr idx_t MAXIMUM_BATCH_SIZE = NumericLimits<int64_t>::Maximum();
+	copy.batch_size = MinValue<idx_t>(catalog.GetConfigOption<idx_t>("parquet_row_group_size", schema_id, table_id,
+	                                                                 DEFAULT_ROW_GROUP_SIZE, &copy_input.table_options),
+	                                  MAXIMUM_BATCH_SIZE);
+	string row_group_size_bytes;
+	if (catalog.TryGetConfigOption("parquet_row_group_size_bytes", row_group_size_bytes, schema_id, table_id,
+	                               &copy_input.table_options)) {
+		auto batch_size_bytes = DBConfig::ParseMemoryLimit(row_group_size_bytes + " bytes");
+		if (batch_size_bytes.IsValid()) {
+			batch_size_bytes = MinValue<idx_t>(batch_size_bytes.GetIndex(), MAXIMUM_BATCH_SIZE);
 		}
+		copy.batch_size_bytes = batch_size_bytes;
 	}
-
-	auto function_data = copy_fun.function.copy_to_bind(context, bind_input, names_to_write, casted_types);
-
-	DuckLakeCopyOptions result(std::move(info), copy_fun.function);
-	result.bind_data = std::move(function_data);
-
-	result.use_tmp_file = false;
-	if (copy_input.partition_data) {
-		result.filename_pattern.SetFilenamePattern("ducklake-{uuidv7}");
-		result.partition_output = true;
-		result.write_empty_file = true;
-		result.rotate = false;
+	if (GetPartitionId(copy_input.partition_data).IsValid()) {
+		copy.partition_output = true;
+		copy.write_empty_file = true;
 	} else {
-		result.filename_pattern.SetFilenamePattern("ducklake-{uuidv7}");
-		result.partition_output = false;
-		result.write_empty_file = false;
-		// file_size_bytes is currently only supported for unpartitioned writes
-		result.file_size_bytes = target_file_size;
-		result.rotate = true;
+		copy.partition_output = false;
+		copy.write_empty_file = false;
 	}
-	result.file_path = copy_input.data_path;
-	StripTrailingSeparator(fs, result.file_path);
-	result.file_extension = data_file_format;
-	result.overwrite_mode = CopyOverwriteMode::COPY_OVERWRITE_OR_IGNORE;
-	result.per_thread_output = per_thread_output;
-	result.write_partition_columns = true;
+	copy.file_path = PhysicalCopyToFile::GetTrimmedPath(context, copy_input.data_path);
+	copy.file_extension = data_file_format;
+	copy.overwrite_mode = CopyOverwriteMode::COPY_OVERWRITE_OR_IGNORE;
+	copy.per_thread_output = per_thread_output;
+	copy.write_partition_columns = true;
+	copy.hive_file_pattern =
+	    catalog.UseHiveFilePattern(copy_input.encryption_key.empty(), schema_id, table_id, &copy_input.table_options);
 	if (is_parquet) {
-		result.return_type = CopyFunctionReturnType::WRITTEN_FILE_STATISTICS;
+		copy.return_type = CopyFunctionReturnType::WRITTEN_FILE_STATISTICS;
 	} else {
 		// non-parquet COPY functions (vortex) can't report per-file statistics; take the written file
 		// list instead and derive size/row-count ourselves. They also don't implement rotate_next_file,
 		// so we can't use DuckDB's directory+rotation naming - generate a single full file path here
 		// (the plain single-file COPY path) so the writer receives a file, not the table directory.
-		result.return_type = CopyFunctionReturnType::CHANGED_ROWS_AND_FILE_LIST;
-		result.rotate = false;
-		result.per_thread_output = false;
-		result.partition_output = false;
-		result.file_size_bytes = optional_idx();
+		copy.return_type = CopyFunctionReturnType::CHANGED_ROWS_AND_FILE_LIST;
+		copy.rotate = false;
+		copy.per_thread_output = false;
+		copy.partition_output = false;
+		copy.file_size_bytes = optional_idx();
 		auto &transaction = DuckLakeTransaction::Get(context, catalog);
 		auto file_name = "ducklake-" + transaction.GenerateUUID() + "." + data_file_format;
 		// Use DuckLakeUtil::JoinPath (not FileSystem::JoinPath): data_path may already end with a separator
 		// (table data paths are generated with a trailing separator), and FileSystem::JoinPath appends the
 		// separator unconditionally, producing a double slash that S3/minio rejects on the stats read-back.
-		result.file_path = DuckLakeUtil::JoinPath(fs, copy_input.data_path, file_name);
-		result.file_extension = "";
-		result.write_empty_file = false;
+		copy.file_path = DuckLakeUtil::JoinPath(fs, copy_input.data_path, file_name);
+		copy.file_extension = "";
+		copy.write_empty_file = false;
 	}
-	result.names = names_to_write;
-	result.expected_types = types_to_write;
+	copy.names = names_to_write;
+	copy.expected_types = types_to_write;
 
-	if (copy_input.partition_data) {
-		// we are partitioning - generate partition expressions (if any)
+	if (copy.partition_output) {
+		// generate the partition expressions
 		GeneratePartitionExpressions(context, copy_input, result);
+		if (copy.hive_file_pattern && !copy.partition_columns.empty()) {
+			copy.partition_path_expression = DuckLakePartitionUtils::CreatePartitionPathExpression(context, copy);
+			copy.hive_file_pattern = !copy.partition_path_expression;
+		}
 	}
 	return result;
 }
@@ -733,7 +776,7 @@ static void GenerateProjection(ClientContext &context, PhysicalPlanGenerator &pl
 	// push the projection
 	vector<LogicalType> types;
 	for (auto &expr : expressions) {
-		types.push_back(expr->return_type);
+		types.push_back(expr->GetReturnType());
 	}
 	auto &proj =
 	    planner.Make<PhysicalProjection>(std::move(types), std::move(expressions), plan->estimated_cardinality);
@@ -741,116 +784,40 @@ static void GenerateProjection(ClientContext &context, PhysicalPlanGenerator &pl
 	plan = proj;
 }
 
-void DuckLakeInsert::InsertCasts(const vector<LogicalType> &types, ClientContext &context,
-                                 PhysicalPlanGenerator &planner, optional_ptr<PhysicalOperator> &plan) {
-	vector<unique_ptr<Expression>> expressions;
-	idx_t col_idx = 0;
-	for (auto &expected_type : types) {
-		auto expr = make_uniq<BoundReferenceExpression>(expected_type, col_idx++);
-		if (DuckLakeTypes::RequiresCast(expected_type)) {
-			auto new_type = DuckLakeTypes::GetCastedType(expected_type);
-			expressions.push_back(BoundCastExpression::AddCastToType(context, std::move(expr), new_type));
-		} else {
-			expressions.push_back(std::move(expr));
-		}
-	}
-	GenerateProjection(context, planner, expressions, plan);
-}
-
-unique_ptr<LogicalOperator> DuckLakeInsert::InsertCasts(Binder &binder, unique_ptr<LogicalOperator> &plan) {
-	vector<unique_ptr<Expression>> cast_expressions;
-
-	auto &types = plan->types;
-	auto bindings = plan->GetColumnBindings();
-
-	for (idx_t col_idx = 0; col_idx < types.size(); col_idx++) {
-		auto &type = types[col_idx];
-		auto &binding = bindings[col_idx];
-		auto ref_expr = make_uniq<BoundColumnRefExpression>(type, binding);
-		if (DuckLakeTypes::RequiresCast(type)) {
-			auto new_type = DuckLakeTypes::GetCastedType(type);
-			cast_expressions.push_back(
-			    BoundCastExpression::AddCastToType(binder.context, std::move(ref_expr), new_type));
-		} else {
-			cast_expressions.push_back(std::move(ref_expr));
-		}
-	}
-
-	auto result = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(cast_expressions));
-	result->children.push_back(std::move(plan));
-
-	return std::move(result);
-}
-
 PhysicalOperator &DuckLakeInsert::PlanCopyForInsert(ClientContext &context, PhysicalPlanGenerator &planner,
                                                     DuckLakeCopyInput &copy_input,
                                                     optional_ptr<PhysicalOperator> plan) {
-	bool is_encrypted = !copy_input.encryption_key.empty();
 	auto copy_options = GetCopyOptions(context, copy_input);
-	if (!copy_options.projection_list.empty() && plan) {
+	auto &copy = *copy_options.copy;
+	if (!copy_options.projection_list.empty()) {
 		// generate a projection
 		GenerateProjection(context, planner, copy_options.projection_list, plan);
 	}
 
-	if (DuckLakeTypes::RequiresCast(copy_options.expected_types)) {
-		// Insert a cast projection
-		if (plan) {
-			InsertCasts(copy_options.expected_types, context, planner, plan);
-			// Update the expected types to match the cast types
-			copy_options.expected_types = plan->types;
-		} else {
-			// Still update types. If there is no child-plan node, we expect that whoever inserts chunks (e.g.
-			// DuckLakeUpdate, DuckLakeMergeInsert) directly into the physical copy operator will pre-cast the data.
-			for (auto &type : copy_options.expected_types) {
-				if (DuckLakeTypes::RequiresCast(type)) {
-					type = DuckLakeTypes::GetCastedType(type);
-				}
-			}
-		}
+	copy.SetEstimatedCardinality(1);
+	copy.ResolveOperatorTypes();
+	auto &physical_copy = planner.CreatePlan(copy, *plan);
+	if (copy_input.ordered_input && physical_copy.type == PhysicalOperatorType::COPY_TO_FILE) {
+		PreserveSortedOrder(physical_copy.Cast<PhysicalCopyToFile>());
 	}
-
-	auto copy_return_types = GetCopyFunctionReturnLogicalTypes(copy_options.return_type);
-	auto &physical_copy = planner
-	                          .Make<PhysicalCopyToFile>(copy_return_types, std::move(copy_options.copy_function),
-	                                                    std::move(copy_options.bind_data), 1)
-	                          .Cast<PhysicalCopyToFile>();
-
-	physical_copy.file_path = std::move(copy_options.file_path);
-	physical_copy.use_tmp_file = copy_options.use_tmp_file;
-	physical_copy.filename_pattern = std::move(copy_options.filename_pattern);
-	physical_copy.file_extension = std::move(copy_options.file_extension);
-	physical_copy.overwrite_mode = copy_options.overwrite_mode;
-	physical_copy.per_thread_output = copy_options.per_thread_output;
-	physical_copy.file_size_bytes = copy_options.file_size_bytes;
-	physical_copy.rotate = copy_options.rotate;
-	physical_copy.return_type = copy_options.return_type;
-
-	physical_copy.partition_output = copy_options.partition_output;
-	physical_copy.write_partition_columns = copy_options.write_partition_columns;
-	physical_copy.write_empty_file = copy_options.write_empty_file;
-	physical_copy.partition_columns = std::move(copy_options.partition_columns);
-	physical_copy.names = std::move(copy_options.names);
-	physical_copy.expected_types = std::move(copy_options.expected_types);
-	physical_copy.parallel = true;
-	physical_copy.hive_file_pattern =
-	    copy_input.catalog.UseHiveFilePattern(!is_encrypted, copy_input.schema_id, copy_input.table_id);
-	if (plan) {
-		physical_copy.children.push_back(*plan);
-	}
-
 	return physical_copy;
+}
+
+void DuckLakeInsert::PreserveSortedOrder(PhysicalCopyToFile &physical_copy) {
+	if (!physical_copy.function.execution_mode) {
+		return;
+	}
+	// the rows are sorted and the batch copy operator does not rotate files by size
+	auto execution_mode = physical_copy.function.execution_mode(true, false);
+	physical_copy.parallel = execution_mode == CopyFunctionExecutionMode::PARALLEL_COPY_TO_FILE;
 }
 
 PhysicalOperator &DuckLakeInsert::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
                                              DuckLakeTableEntry &table, string encryption_key) {
-	auto partition_data = table.GetPartitionData();
-	optional_idx partition_id;
-	if (partition_data) {
-		partition_id = partition_data->partition_id;
-	}
 	vector<LogicalType> return_types;
 	return_types.emplace_back(LogicalType::BIGINT);
-	return planner.Make<DuckLakeInsert>(return_types, table, partition_id, std::move(encryption_key));
+	return planner.Make<DuckLakeInsert>(return_types, table, GetPartitionId(table.GetPartitionData()),
+	                                    std::move(encryption_key));
 }
 
 string DuckLakeCatalog::GenerateEncryptionKey(ClientContext &context) const {
@@ -858,14 +825,169 @@ string DuckLakeCatalog::GenerateEncryptionKey(ClientContext &context) const {
 		// not encrypted
 		return string();
 	}
-	// generate an encryption key
-	auto &engine = RandomEngine::Get(context);
-	static constexpr const idx_t ENCRYPTION_KEY_SIZE = 16;
+	// 32 bytes = AES-256; generation only, existing keys are read back at whatever length they were
+	// written, so no migration is implied
+	static constexpr const idx_t ENCRYPTION_KEY_SIZE = 32;
 	data_t bytes[ENCRYPTION_KEY_SIZE];
-	for (idx_t i = 0; i < ENCRYPTION_KEY_SIZE; i += 4) {
-		*reinterpret_cast<uint32_t *>(bytes + i) = engine.NextRandomInteger();
-	}
+	EncryptionEngine::GenerateRandomKey(DatabaseInstance::GetDatabase(context), bytes, ENCRYPTION_KEY_SIZE);
 	return string(char_ptr_cast(bytes), ENCRYPTION_KEY_SIZE);
+}
+
+//! Rebinds a prepared statement on every execution if it inserts with sort keys that depend on the session
+class DuckLakeSortRebindState : public ClientContextState {
+public:
+	static constexpr const char *KEY = "ducklake_sort_rebind";
+
+	RebindQueryInfo OnRebindPreparedStatement(ClientContext &context, BindPreparedStatementCallbackInfo &info,
+	                                          RebindQueryInfo current_rebind) override {
+		auto &physical_plan = info.prepared_statement.physical_plan;
+		if (physical_plan && SortRequiresRebind(physical_plan->Root())) {
+			return RebindQueryInfo::ATTEMPT_TO_REBIND;
+		}
+		return RebindQueryInfo::DO_NOT_REBIND;
+	}
+
+private:
+	static bool SortRequiresRebind(const PhysicalOperator &op) {
+		auto insert = dynamic_cast<const DuckLakeInsert *>(&op);
+		if (insert && insert->sort_requires_rebind) {
+			return true;
+		}
+		for (auto &child : op.GetChildren()) {
+			if (SortRequiresRebind(child.get())) {
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+//! Wrap the plan in an ORDER BY on the sort keys, usable before the table entry exists (CTAS)
+static optional_ptr<PhysicalOperator> PlanInsertSort(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                     PhysicalOperator &plan, SchemaCatalogEntry &schema,
+                                                     const ColumnList &columns, const Identifier &table_name,
+                                                     const DuckLakeSort &sort_data, bool &requires_rebind) {
+	auto binder = Binder::CreateBinder(context);
+	TableIndex table_index(0);
+	auto orders = DuckLakeCompactor::BindSortOrders(*binder, schema, columns, table_name, table_index,
+	                                                DuckLakeCompactor::ParseSortOrders(sort_data));
+	// the sort keys are bound after the statement, which can neither register their writes nor rebind for them
+	auto &properties = binder->GetStatementProperties();
+	auto &catalog_name = schema.ParentCatalog().GetName();
+	auto verify_database = [&](const Identifier &database) {
+		if (!(database == catalog_name)) {
+			throw BinderException("The sort keys of table %s use database %s, which is not supported when inserting. "
+			                      "Use ALTER TABLE ... RESET SORTED BY to remove them",
+			                      SQLIdentifier(table_name.GetIdentifierName()),
+			                      SQLIdentifier(database.GetIdentifierName()));
+		}
+	};
+	for (auto &entry : properties.modified_databases) {
+		verify_database(entry.first);
+	}
+	for (auto &entry : properties.read_databases) {
+		verify_database(entry.first);
+	}
+	if (orders.empty()) {
+		return nullptr;
+	}
+	// the sort keys are bound after the statement, so the statement cannot know that they need a rebind
+	if (binder->GetStatementProperties().always_require_rebind) {
+		requires_rebind = true;
+		context.registered_state->GetOrCreate<DuckLakeSortRebindState>(DuckLakeSortRebindState::KEY);
+	}
+
+	// Convert BoundColumnRefExpression to BoundReferenceExpression for physical plan
+	auto bindings = LogicalOperator::GenerateColumnBindings(table_index, plan.GetTypes().size());
+	ColumnBindingResolver resolver(std::move(bindings), plan.GetTypes());
+	for (auto &order : orders) {
+		resolver.VisitExpression(&order.expression);
+	}
+
+	auto projection_map = PhysicalJoin::FillProjectionMap(plan, {});
+	auto &order_op = planner.Make<PhysicalOrder>(plan.types, std::move(orders), std::move(projection_map),
+	                                             plan.estimated_cardinality);
+	order_op.children.push_back(plan);
+	return &order_op;
+}
+
+DuckLakeInsertPipeline DuckLakeInsert::PlanInsertPipeline(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                          PhysicalOperator &plan, SchemaCatalogEntry &schema,
+                                                          const ColumnList &columns, const Identifier &table_name,
+                                                          optional_ptr<DuckLakeSort> sort_data, bool sort_on_insert,
+                                                          idx_t data_inlining_row_limit) {
+	DuckLakeInsertPipeline result {plan, nullptr, false};
+	if (sort_data && sort_on_insert) {
+		auto sorted_plan = PlanInsertSort(context, planner, result.root.get(), schema, columns, table_name, *sort_data,
+		                                  result.sort_requires_rebind);
+		if (sorted_plan) {
+			result.root = *sorted_plan;
+			result.sorted = true;
+		}
+	}
+	if (data_inlining_row_limit > 0) {
+		auto &inline_data =
+		    planner.Make<DuckLakeInlineData>(result.root.get(), schema.ParentCatalog(), data_inlining_row_limit);
+		result.inline_data = inline_data.Cast<DuckLakeInlineData>();
+		result.root = inline_data;
+		// with sort_on_insert off only the Parquet bound overflow rows are sorted, after inlining
+		if (sort_data && !sort_on_insert) {
+			auto sorted_plan = PlanInsertSort(context, planner, result.root.get(), schema, columns, table_name,
+			                                  *sort_data, result.sort_requires_rebind);
+			if (sorted_plan) {
+				result.root = *sorted_plan;
+				result.sorted = true;
+			}
+		}
+	}
+	return result;
+}
+
+PhysicalOperator &DuckLakeInsertPipeline::AttachInsert(PhysicalOperator &insert, PhysicalOperator &copy) {
+	if (inline_data) {
+		inline_data->insert = insert.Cast<DuckLakeInsert>();
+	}
+	insert.Cast<DuckLakeInsert>().sort_requires_rebind = sort_requires_rebind;
+	insert.children.push_back(copy);
+	return insert;
+}
+
+DuckLakeVerifyNotNull::DuckLakeVerifyNotNull(PhysicalPlan &physical_plan, PhysicalOperator &child,
+                                             Identifier table_name, vector<pair<idx_t, Identifier>> columns)
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, child.types, child.estimated_cardinality),
+      table_name(std::move(table_name)), columns(std::move(columns)) {
+	children.push_back(child);
+}
+
+PhysicalOperator &DuckLakeVerifyNotNull::Plan(PhysicalPlanGenerator &planner, DuckLakeTableEntry &table,
+                                              PhysicalOperator &plan) {
+	auto not_null_fields = table.GetNotNullFields();
+	vector<pair<idx_t, Identifier>> columns;
+	for (auto &col : table.GetColumns().Physical()) {
+		if (!FileStatsShowNulls(col.Type()) && not_null_fields.count(col.Name())) {
+			columns.emplace_back(col.Physical().index, col.Name());
+		}
+	}
+	if (columns.empty()) {
+		return plan;
+	}
+	return planner.Make<DuckLakeVerifyNotNull>(plan, table.name, std::move(columns));
+}
+
+OperatorResultType DuckLakeVerifyNotNull::Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
+                                                  GlobalOperatorState &gstate, OperatorState &state) const {
+	for (auto &column : columns) {
+		if (VectorOperations::HasNull(input.data[column.first])) {
+			throw ConstraintException("NOT NULL constraint failed: %s.%s", SQLIdentifier(table_name),
+			                          SQLIdentifier(column.second));
+		}
+	}
+	chunk.Reference(input);
+	return OperatorResultType::NEED_MORE_INPUT;
+}
+
+string DuckLakeVerifyNotNull::GetName() const {
+	return "DUCKLAKE_VERIFY_NOT_NULL";
 }
 
 PhysicalOperator &DuckLakeCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
@@ -877,24 +999,21 @@ PhysicalOperator &DuckLakeCatalog::PlanInsert(ClientContext &context, PhysicalPl
 		throw BinderException("ON CONFLICT clause not yet supported for insertion into DuckLake table");
 	}
 	if (!op.column_index_map.empty()) {
+		// LCOV_EXCL_START
 		plan = planner.ResolveDefaultsProjection(op, *plan);
+		// LCOV_EXCL_STOP
 	}
 	auto &ducklake_table = op.table.Cast<DuckLakeTableEntry>();
-	optional_ptr<DuckLakeInlineData> inline_data;
+	auto &verified_plan = DuckLakeVerifyNotNull::Plan(planner, ducklake_table, *plan);
+	auto pipeline = DuckLakeInsert::PlanInsertPipeline(
+	    context, planner, verified_plan, ducklake_table.schema, ducklake_table.GetColumns(), ducklake_table.name,
+	    ducklake_table.GetSortData(), SortOnInsert(ducklake_table), GetInliningLimit(context, ducklake_table));
 
-	idx_t data_inlining_row_limit = GetInliningLimit(context, ducklake_table, plan->types);
-	if (data_inlining_row_limit > 0) {
-		plan = planner.Make<DuckLakeInlineData>(*plan, data_inlining_row_limit);
-		inline_data = plan->Cast<DuckLakeInlineData>();
-	}
 	DuckLakeCopyInput copy_input(context, ducklake_table);
-	auto &physical_copy = DuckLakeInsert::PlanCopyForInsert(context, planner, copy_input, plan);
+	copy_input.ordered_input = pipeline.sorted;
+	auto &physical_copy = DuckLakeInsert::PlanCopyForInsert(context, planner, copy_input, pipeline.root.get());
 	auto &insert = DuckLakeInsert::PlanInsert(context, planner, ducklake_table, std::move(copy_input.encryption_key));
-	if (inline_data) {
-		inline_data->insert = insert.Cast<DuckLakeInsert>();
-	}
-	insert.children.push_back(physical_copy);
-	return insert;
+	return pipeline.AttachInsert(insert, physical_copy);
 }
 
 PhysicalOperator &DuckLakeCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
@@ -903,32 +1022,40 @@ PhysicalOperator &DuckLakeCatalog::PlanCreateTableAs(ClientContext &context, Phy
 	auto &columns = create_info.columns;
 	auto &duck_transaction = DuckLakeTransaction::Get(context, *this);
 	auto &duck_schema = op.schema.Cast<DuckLakeSchemaEntry>();
-	// FIXME: if table already exists and we are doing CREATE IF NOT EXISTS - skip
-	reference<PhysicalOperator> root = plan;
-	optional_ptr<DuckLakeInlineData> inline_data;
-	idx_t data_inlining_row_limit = DataInliningRowLimit(context, duck_schema.GetSchemaId(), TableIndex());
-	auto &metadata_manager = duck_transaction.GetMetadataManager();
-	if (data_inlining_row_limit > 0 && !DuckLakeUtil::HasInlinedSystemColumnConflict(columns) &&
-	    metadata_manager.SupportsInliningTypes(plan.types)) {
-		root = planner.Make<DuckLakeInlineData>(root.get(), data_inlining_row_limit);
-		inline_data = root.get().Cast<DuckLakeInlineData>();
+
+	// The table entry doesn't exist yet; build field/partition/sort specs now so the physical write can use them.
+	auto field_data = DuckLakeFieldData::FromColumns(columns, context);
+	unique_ptr<DuckLakePartition> partition_data;
+	if (!create_info.partition_keys.empty()) {
+		partition_data =
+		    DuckLakeTableEntry::BuildPartitionData(duck_transaction, columns, *field_data, create_info.partition_keys);
 	}
-	for (auto &col : op.info->Base().columns.Logical()) {
-		DuckLakeTypes::CheckSupportedType(col.Type());
-	}
+	auto sort_data = DuckLakeTableEntry::BuildSortData(duck_transaction, columns, create_info.sort_keys);
+	auto table_options = DuckLakeTableEntry::ParseTableOptions(
+	    context, *this, create_info.options, columns, *field_data, partition_data.get(), create_info.GetTableName());
+
+	// No table id yet, so the WITH options stand in for the table scope
+	auto pipeline = DuckLakeInsert::PlanInsertPipeline(
+	    context, planner, plan, op.schema, columns, create_info.GetTableName(), sort_data.get(),
+	    SortOnInsert(duck_schema.GetSchemaId(), TableIndex(), &table_options),
+	    GetInliningLimit(context, create_info.GetTableName(), duck_schema.GetSchemaId(), TableIndex(), columns,
+	                     &table_options));
+
+	DuckLakeTypes::CheckSupportedTypes(columns, GetDuckLakeVersion());
 	auto table_uuid = duck_transaction.GenerateUUID();
 	auto table_data_path =
-	    duck_schema.DataPath() + DuckLakeCatalog::GeneratePathFromName(table_uuid, create_info.table);
+	    duck_schema.GenerateTableDataPath(table_uuid, create_info.GetTableName().GetIdentifierName());
 
-	DuckLakeCopyInput copy_input(context, duck_schema, columns, table_data_path);
-	auto &physical_copy = DuckLakeInsert::PlanCopyForInsert(context, planner, copy_input, root.get());
-	auto &insert = planner.Make<DuckLakeInsert>(op.types, op.schema, std::move(op.info), std::move(table_uuid),
-	                                            std::move(table_data_path), std::move(copy_input.encryption_key));
-	if (inline_data) {
-		inline_data->insert = insert.Cast<DuckLakeInsert>();
-	}
-	insert.children.push_back(physical_copy);
-	return insert;
+	DuckLakeCopyInput copy_input(context, duck_schema, columns, table_data_path, *field_data, partition_data.get());
+	copy_input.table_options = table_options;
+	copy_input.ordered_input = pipeline.sorted;
+	auto &physical_copy = DuckLakeInsert::PlanCopyForInsert(context, planner, copy_input, pipeline.root.get());
+
+	auto &insert =
+	    planner.Make<DuckLakeInsert>(op.types, op.schema, std::move(op.info), std::move(table_uuid),
+	                                 std::move(table_data_path), std::move(partition_data), std::move(sort_data),
+	                                 std::move(table_options), std::move(copy_input.encryption_key));
+	return pipeline.AttachInsert(insert, physical_copy);
 }
 
 } // namespace duckdb

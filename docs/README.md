@@ -9,9 +9,6 @@
 
 # DuckDB DuckLake Extension
 
-> While we tested the DuckLake extension extensively, it is currently experimental as demonstrated by its version number 0.x.
-> If you encounter any problems, please file a [new issue](https://github.com/duckdb/ducklake/issues).
-
 DuckLake is an open Lakehouse format that is built on SQL and Parquet. DuckLake stores metadata in a [catalog database](https://ducklake.select/docs/stable/duckdb/usage/choosing_a_catalog_database), and stores data in Parquet files. The DuckLake extension allows DuckDB to directly read and write data from DuckLake.
 
 See the [DuckLake website](https://ducklake.select) for more information.
@@ -104,13 +101,58 @@ See the [Usage](https://ducklake.select/docs/stable/duckdb/introduction) guide f
 To build, type
 ```
 git submodule init
-git submodule update
+git submodule update --recursive
 # to build with multiple cores, use `make GEN=ninja release`
-make pull
 make
 ```
+
+The submodules are pinned to the DuckDB version in `.github/duckdb-version`, which is what CI builds against. `make pull`
+moves them to the tip of their branch instead, where the build can fail.
 
 To run, run the bundled `duckdb` shell:
 ```
  ./build/release/duckdb
 ```
+
+## Contributing
+
+We are happy to welcome external contributions to our DuckLake extension. Our active development branch is currently `main`, and all contributions should target that branch.
+
+## Testing
+
+```bash
+# run all DuckLake extension tests
+./build/release/test/unittest
+# run a single test file
+./build/release/test/unittest test/sql/transaction/create_conflict.test
+# run tests matching a pattern
+./build/release/test/unittest "test/sql/partitioning/*"
+
+# run DuckDB core tests using DuckLake as storage backend
+./build/release/test/unittest --test-config test/configs/attach_ducklake.json --test-dir duckdb
+
+# run DuckLake tests using PostgreSQL as catalog database (requires running PostgreSQL)
+./build/release/test/unittest --test-config test/configs/postgres.json
+# run DuckLake tests using SQLite as catalog database
+./build/release/test/unittest --test-config test/configs/sqlite.json
+
+# run tests with deletion vectors enabled
+./build/release/test/unittest --test-config test/configs/deletion_vectors.json
+```
+
+### Code Coverage
+
+`make codecov` builds `build/codecov`, a release build in which only the DuckLake sources are instrumented for clang's
+source-based code coverage, like `make codecov` in DuckDB. DuckDB's test runner then writes the coverage report of the
+tests it runs, by default the fast ones. It needs `llvm-profdata`, `llvm-cov` and `genhtml` from lcov 2.0 to 2.5 (2.2
+and 2.6 fail on its options). Run it from the repository root, so the report only shows `src`:
+
+```bash
+python3 duckdb/scripts/ci/run_tests.py build/codecov/test/unittest --coverage-report build/codecov/coverage/fast
+# any test runner argument works, e.g. the tests with SQLite as catalog database
+python3 duckdb/scripts/ci/run_tests.py build/codecov/test/unittest --coverage-report build/codecov/coverage/sqlite \
+  --test-config test/configs/sqlite.json "test/sql/*"
+```
+
+CI merges the coverage of the tests of every metadata catalog (DuckDB, PostgreSQL, SQLite and Quack) into the
+`coverage-ducklake` artifact, and fails a pull request that lowers the line coverage of the latest report of `main`.

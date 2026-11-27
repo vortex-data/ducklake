@@ -3,6 +3,8 @@
 
 namespace duckdb {
 
+namespace {
+
 enum class ChangeType {
 	CREATED_TABLE,
 	CREATED_VIEW,
@@ -23,10 +25,39 @@ enum class ChangeType {
 	CREATED_SCALAR_MACRO,
 	CREATED_TABLE_MACRO,
 	DROPPED_SCALAR_MACRO,
-	DROPPED_TABLE_MACRO
+	DROPPED_TABLE_MACRO,
+	CREATED_SNAPSHOT_TAG,
+	DROPPED_SNAPSHOT_TAG,
+	EXPIRED_SNAPSHOT
 };
 
-struct ChangeInfo {
+constexpr StringUtil::EnumStringLiteral CHANGE_TYPE_NAMES[] = {
+    {static_cast<uint32_t>(ChangeType::CREATED_TABLE), "created_table"},
+    {static_cast<uint32_t>(ChangeType::CREATED_VIEW), "created_view"},
+    {static_cast<uint32_t>(ChangeType::CREATED_SCALAR_MACRO), "created_scalar_macro"},
+    {static_cast<uint32_t>(ChangeType::CREATED_TABLE_MACRO), "created_table_macro"},
+    {static_cast<uint32_t>(ChangeType::CREATED_SCHEMA), "created_schema"},
+    {static_cast<uint32_t>(ChangeType::DROPPED_SCHEMA), "dropped_schema"},
+    {static_cast<uint32_t>(ChangeType::DROPPED_TABLE), "dropped_table"},
+    {static_cast<uint32_t>(ChangeType::DROPPED_VIEW), "dropped_view"},
+    {static_cast<uint32_t>(ChangeType::INSERTED_INTO_TABLE), "inserted_into_table"},
+    {static_cast<uint32_t>(ChangeType::DROPPED_SCALAR_MACRO), "dropped_scalar_macro"},
+    {static_cast<uint32_t>(ChangeType::DROPPED_TABLE_MACRO), "dropped_table_macro"},
+    {static_cast<uint32_t>(ChangeType::ALTERED_TABLE), "altered_table"},
+    {static_cast<uint32_t>(ChangeType::ALTERED_VIEW), "altered_view"},
+    {static_cast<uint32_t>(ChangeType::DELETED_FROM_TABLE), "deleted_from_table"},
+    {static_cast<uint32_t>(ChangeType::COMPACTED_TABLE), "compacted_table"},
+    {static_cast<uint32_t>(ChangeType::MERGE_ADJACENT), "merge_adjacent"},
+    {static_cast<uint32_t>(ChangeType::REWRITE_DELETE), "rewrite_delete"},
+    {static_cast<uint32_t>(ChangeType::INSERTED_INTO_TABLE_INLINED), "inlined_insert"},
+    {static_cast<uint32_t>(ChangeType::DELETED_FROM_TABLE_INLINED), "inlined_delete"},
+    {static_cast<uint32_t>(ChangeType::FLUSHED_INLINE_DATA_FOR_TABLE), "flushed_inlined"},
+    {static_cast<uint32_t>(ChangeType::FLUSHED_INLINE_DATA_FOR_TABLE), "inline_flush"},
+    {static_cast<uint32_t>(ChangeType::CREATED_SNAPSHOT_TAG), "created_tag"},
+    {static_cast<uint32_t>(ChangeType::DROPPED_SNAPSHOT_TAG), "dropped_tag"},
+    {static_cast<uint32_t>(ChangeType::EXPIRED_SNAPSHOT), "expired_snapshot"}};
+
+struct ParsedChange {
 	ChangeType change_type;
 	string change_value;
 };
@@ -39,48 +70,11 @@ ChangeType ParseChangeType(const string &changes_made, idx_t &pos) {
 		}
 	}
 	auto change_type_str = changes_made.substr(start_pos, pos - start_pos);
-	if (StringUtil::CIEquals(change_type_str, "created_table")) {
-		return ChangeType::CREATED_TABLE;
-	} else if (StringUtil::CIEquals(change_type_str, "created_view")) {
-		return ChangeType::CREATED_VIEW;
-	} else if (StringUtil::CIEquals(change_type_str, "created_scalar_macro")) {
-		return ChangeType::CREATED_SCALAR_MACRO;
-	} else if (StringUtil::CIEquals(change_type_str, "created_table_macro")) {
-		return ChangeType::CREATED_TABLE_MACRO;
-	} else if (StringUtil::CIEquals(change_type_str, "created_schema")) {
-		return ChangeType::CREATED_SCHEMA;
-	} else if (StringUtil::CIEquals(change_type_str, "dropped_schema")) {
-		return ChangeType::DROPPED_SCHEMA;
-	} else if (StringUtil::CIEquals(change_type_str, "dropped_table")) {
-		return ChangeType::DROPPED_TABLE;
-	} else if (StringUtil::CIEquals(change_type_str, "dropped_view")) {
-		return ChangeType::DROPPED_VIEW;
-	} else if (StringUtil::CIEquals(change_type_str, "inserted_into_table")) {
-		return ChangeType::INSERTED_INTO_TABLE;
-	} else if (StringUtil::CIEquals(change_type_str, "dropped_scalar_macro")) {
-		return ChangeType::DROPPED_SCALAR_MACRO;
-	} else if (StringUtil::CIEquals(change_type_str, "dropped_table_macro")) {
-		return ChangeType::DROPPED_TABLE_MACRO;
-	} else if (StringUtil::CIEquals(change_type_str, "altered_table")) {
-		return ChangeType::ALTERED_TABLE;
-	} else if (StringUtil::CIEquals(change_type_str, "altered_view")) {
-		return ChangeType::ALTERED_VIEW;
-	} else if (StringUtil::CIEquals(change_type_str, "deleted_from_table")) {
-		return ChangeType::DELETED_FROM_TABLE;
-	} else if (StringUtil::CIEquals(change_type_str, "compacted_table")) {
-		return ChangeType::COMPACTED_TABLE;
-	} else if (StringUtil::CIEquals(change_type_str, "merge_adjacent")) {
-		return ChangeType::MERGE_ADJACENT;
-	} else if (StringUtil::CIEquals(change_type_str, "rewrite_delete")) {
-		return ChangeType::REWRITE_DELETE;
-	} else if (StringUtil::CIEquals(change_type_str, "inlined_insert")) {
-		return ChangeType::INSERTED_INTO_TABLE_INLINED;
-	} else if (StringUtil::CIEquals(change_type_str, "inlined_delete")) {
-		return ChangeType::DELETED_FROM_TABLE_INLINED;
-	} else if (StringUtil::CIEquals(change_type_str, "flushed_inlined") ||
-	           StringUtil::CIEquals(change_type_str, "inline_flush")) {
-		return ChangeType::FLUSHED_INLINE_DATA_FOR_TABLE;
-	} else {
+	try {
+		return static_cast<ChangeType>(
+		    StringUtil::StringToEnum(CHANGE_TYPE_NAMES, sizeof(CHANGE_TYPE_NAMES) / sizeof(CHANGE_TYPE_NAMES[0]),
+		                             "ChangeType", change_type_str.c_str()));
+	} catch (NotImplementedException &) {
 		throw InvalidInputException("Unsupported change type %s", change_type_str);
 	}
 }
@@ -101,8 +95,8 @@ string ParseChangeValue(const string &changes_made, idx_t &pos) {
 	return changes_made.substr(start_pos, pos - start_pos);
 }
 
-ChangeInfo ParseChangeEntry(const string &changes_made, idx_t &pos) {
-	ChangeInfo info;
+ParsedChange ParseChangeEntry(const string &changes_made, idx_t &pos) {
+	ParsedChange info;
 	info.change_type = ParseChangeType(changes_made, pos);
 	if (pos >= changes_made.size() || changes_made[pos] != ':') {
 		throw InvalidInputException("Expected a colon after the change type");
@@ -112,8 +106,8 @@ ChangeInfo ParseChangeEntry(const string &changes_made, idx_t &pos) {
 	return info;
 }
 
-vector<ChangeInfo> ParseChangesList(const string &changes_made) {
-	vector<ChangeInfo> result;
+vector<ParsedChange> ParseChangesList(const string &changes_made) {
+	vector<ParsedChange> result;
 	idx_t pos = 0;
 	while (pos < changes_made.size()) {
 		result.push_back(ParseChangeEntry(changes_made, pos));
@@ -128,6 +122,8 @@ vector<ChangeInfo> ParseChangesList(const string &changes_made) {
 	return result;
 }
 
+} // namespace
+
 SnapshotChangeInformation SnapshotChangeInformation::ParseChangesMade(const string &changes_made) {
 	auto change_list = ParseChangesList(changes_made);
 
@@ -136,30 +132,29 @@ SnapshotChangeInformation SnapshotChangeInformation::ParseChangesMade(const stri
 		switch (entry.change_type) {
 		case ChangeType::CREATED_TABLE: {
 			auto catalog_value = DuckLakeUtil::ParseCatalogEntry(entry.change_value);
-			result.created_tables[catalog_value.schema].insert(make_pair(std::move(catalog_value.name), "table"));
+			result.created_tables[catalog_value.SchemaKey()].insert(make_pair(std::move(catalog_value.name), "table"));
 			break;
 		}
 		case ChangeType::CREATED_SCALAR_MACRO: {
 			auto catalog_value = DuckLakeUtil::ParseCatalogEntry(entry.change_value);
-			result.created_scalar_macros[catalog_value.schema].insert(
+			result.created_scalar_macros[catalog_value.SchemaKey()].insert(
 			    make_pair(std::move(catalog_value.name), "scalar_macro"));
 			break;
 		}
 		case ChangeType::CREATED_TABLE_MACRO: {
 			auto catalog_value = DuckLakeUtil::ParseCatalogEntry(entry.change_value);
-			result.created_table_macros[catalog_value.schema].insert(
+			result.created_table_macros[catalog_value.SchemaKey()].insert(
 			    make_pair(std::move(catalog_value.name), "table_macro"));
 			break;
 		}
 		case ChangeType::CREATED_VIEW: {
 			auto catalog_value = DuckLakeUtil::ParseCatalogEntry(entry.change_value);
-			result.created_tables[catalog_value.schema].insert(make_pair(std::move(catalog_value.name), "view"));
+			result.created_tables[catalog_value.SchemaKey()].insert(make_pair(std::move(catalog_value.name), "view"));
 			break;
 		}
 		case ChangeType::CREATED_SCHEMA: {
-			idx_t pos = 0;
-			auto schema_name = DuckLakeUtil::ParseQuotedValue(entry.change_value, pos);
-			result.created_schemas.insert(std::move(schema_name));
+			auto schema_path = StringsToIdentifiers(DuckLakeUtil::ParseQuotedList(entry.change_value, '.'));
+			result.created_schemas.insert(DuckLakeUtil::ToQuotedList(schema_path, '.'));
 			break;
 		}
 		case ChangeType::DROPPED_SCHEMA:
@@ -206,6 +201,19 @@ SnapshotChangeInformation SnapshotChangeInformation::ParseChangesMade(const stri
 			break;
 		case ChangeType::FLUSHED_INLINE_DATA_FOR_TABLE:
 			result.tables_flushed_inlined.insert(TableIndex(StringUtil::ToUnsigned(entry.change_value)));
+			break;
+		case ChangeType::CREATED_SNAPSHOT_TAG: {
+			idx_t pos = 0;
+			result.created_snapshot_tags.insert(DuckLakeUtil::ParseQuotedValue(entry.change_value, pos));
+			break;
+		}
+		case ChangeType::DROPPED_SNAPSHOT_TAG: {
+			idx_t pos = 0;
+			result.dropped_snapshot_tags.insert(DuckLakeUtil::ParseQuotedValue(entry.change_value, pos));
+			break;
+		}
+		case ChangeType::EXPIRED_SNAPSHOT:
+			result.expired_snapshots.insert(StringUtil::ToUnsigned(entry.change_value));
 			break;
 		default:
 			throw InternalException("Unsupported change type in ParseChangesMade");

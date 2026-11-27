@@ -1,0 +1,274 @@
+{
+  "description": "Run DuckLake tests using a Quack RPC server as a catalog DBMS.",
+  "on_init": "LOAD httpfs; LOAD quack; SET enable_progress_bar=false; CREATE OR REPLACE SECRET ducklake_test_quack (TYPE quack, TOKEN 'ducklake-test-token');",
+  "autoloading": "none",
+  "statically_loaded_extensions": [
+    "core_functions",
+    "parquet",
+    "ducklake",
+    "httpfs",
+    "icu"
+  ],
+  "skip_error_messages": [
+    "__never_match__"
+  ],
+  "test_env": [
+    {
+      "env_name": "DUCKLAKE_CONNECTION",
+      "env_value": "quack:localhost:19999"
+    }
+  ],
+  "skip_tests": [
+    {
+      "reason": "Only DuckDB catalogs drop the empty inlined data table that an ALTER supersedes",
+      "paths": [
+        "test/sql/alter/alter_drops_empty_inlined_tables.test"
+      ]
+    },
+    {
+      "reason": "Quack deletes expired snapshots when the transaction commits, so the gap is not visible inside the transaction",
+      "paths": [
+        "test/sql/time_travel/at_timestamp_expired_in_transaction.test"
+      ]
+    },
+    {
+      "reason": "Quack commits each statement, so a cached timestamp is checked again for concurrent expiries",
+      "paths": [
+        "test/sql/time_travel/at_timestamp_cached_no_rescan.test"
+      ]
+    },
+    {
+      "reason": "Bespoke test starts and stops its own quack server",
+      "paths": [
+        "test/sql/quack/quack_basic.test"
+      ]
+    },
+    {
+      "reason": "Test only for SQLite as catalog",
+      "paths": [
+        "test/sql/metadata/ducklake_settings_sqlite.test",
+        "test/sql/metadata/sqlite_all_varchar.test",
+        "test/sql/data_inlining/sqlite_column_limit.test",
+        "test/sql/data_inlining/sqlite_system_column_names.test",
+        "test/sql/data_inlining/data_inlining_variant_sql_rollback.test"
+      ]
+    },
+    {
+      "reason": "Test only for Postgres as catalog",
+      "paths": [
+        "test/sql/metadata/ducklake_settings_postgres.test",
+        "test/sql/metadata/postgres_long_metadata_schema.test",
+        "test/sql/retry/postgres_rollback_connection_loss.test",
+        "test/sql/metadata/metadata_schema_scoped_attach.test",
+        "test/sql/migration/postgres_concurrent_migration.test",
+        "test/sql/retry/postgres_localized_conflict_retry.test",
+        "test/sql/retry/postgres_commit_connection_loss.test",
+        "test/sql/concurrent/postgres_concurrent_attach_new.test",
+        "test/sql/concurrent/postgres_concurrent_attach_other_catalogs.test",
+        "test/sql/metadata/postgres_cache_clear_scope.test",
+        "test/sql/concurrent/postgres_concurrent_attach_new_migrate.test",
+        "test/sql/migration/postgres_dev_migration_failure.test",
+        "test/sql/migration/postgres_dev1_migration_skips_present_ddl.test",
+        "test/sql/migration/postgres_row_companions_index_names.test",
+        "test/sql/benchmark/postgres_catalog.test",
+        "test/sql/issues/issue_843_postgres_legacy_inlined_types.test",
+        "test/sql/data_inlining/inlined_superseded_drop_failure_postgres.test",
+        "test/sql/compaction/compaction_idle_metadata_transaction.test",
+        "test/sql/compaction/postgres_expire_snapshots_time_zone.test",
+        "test/sql/retry/postgres_commit_error_query_text.test",
+        "test/sql/settings/set_option_concurrent_insert.test",
+        "test/sql/settings/set_option_concurrent_insert_read_committed.test",
+        "test/sql/settings/set_option_concurrent_insert_expiry.test",
+        "test/sql/settings/set_option_read_committed_reset_race.test",
+        "test/sql/tags/postgres_tags_read_committed.test",
+        "test/sql/general/postgres_nul_byte_text.test",
+        "test/sql/data_inlining/postgres_new_inlined_table_keeps_cache.test",
+        "test/sql/transaction/postgres_failed_rollback_releases_transaction.test",
+        "test/sql/metadata/postgres_attach_cache_clear.test",
+        "test/sql/time_travel/postgres_at_timestamp_expired_read_committed.test",
+        "test/sql/catalog/snapshot_branch_key_statements_postgres.test"
+      ]
+    },
+    {
+      "reason": "Modifies connection string",
+      "paths": [
+        "test/sql/catalog/quoted_identifiers.test",
+        "test/sql/stats/count_star_optimization_file_operations.test"
+      ]
+    },
+    {
+      "reason": "Migration tests assume specific catalog backend",
+      "paths": [
+        "test/sql/migration/v01.test",
+        "test/sql/migration/v01_partitioned.test"
+      ]
+    },
+    {
+      "reason": "Test issues UPDATE against the metadata catalog directly",
+      "paths": [
+        "test/sql/delete/delete_legacy_missing_mapping_after_rename_add_files.test",
+        "test/sql/rewrite_data_files/test_rewrite_many_non_candidate_files.test",
+        "test/sql/stats/nan_column_stats_missing_max.test",
+        "test/sql/stats/nan_column_stats_missing_min.test",
+        "test/sql/stats/numeric_stats_one_bound.test"
+      ]
+    },
+    {
+      "reason": "FIXME: quack catalog does not implement GetDatabaseSize",
+      "paths": [
+        "test/sql/general/database_size.test"
+      ]
+    },
+    {
+      "reason": "Test appends a suffix to DUCKLAKE_CONNECTION",
+      "paths": [
+        "test/sql/data_inlining/partition_inlining.test"
+      ]
+    },
+    {
+      "reason": "Uses the S3 test server",
+      "paths": [
+        "test/sql/delete/delete_metadata.test"
+      ]
+    },
+    {
+      "reason": "require spatial",
+      "paths": [
+        "test/sql/sorted_table/merge_adjacent_sorted_spatial_hilbert.test"
+      ]
+    },
+    {
+      "reason": "require postgres_scanner",
+      "paths": [
+        "test/sql/autoloading/autoload_data_path.test",
+        "test/sql/data_inlining/postgres_identifier_limit.test",
+        "test/sql/data_inlining/postgres_system_column_names.test",
+        "test/sql/metadata/postgres_text_protocol.test",
+        "test/sql/data_inlining/postgres_column_limit.test",
+        "test/sql/issues/issue_sqlite_snapshot_time.test",
+        "test/sql/metadata/ducklake_settings_s3.test"
+      ]
+    },
+    {
+      "reason": "Not implemented Error: InMemory not implemented yet",
+      "paths": [
+        "test/sql/metadata/hide_metadata_catalog.test"
+      ]
+    },
+    {
+      "reason": "set_option writes its ducklake_metadata row eagerly instead of staging it for commit like every other change, so a ROLLBACK leaves the row behind on quack, where each metadata statement runs on the server outside the local transaction. Rolled-back DDL is unaffected - that is only written at commit.",
+      "paths": [
+        "test/sql/stats/skip_stats_columns_transaction.test",
+        "test/sql/compaction/compaction_failed_statement_rollback.test"
+      ]
+    },
+    {
+      "reason": "Snapshots expire when the transaction commits on quack so a rollback keeps them, so a cleanup in the same transaction does not see their files yet.",
+      "paths": [
+        "test/sql/transaction/expire_cleanup_same_transaction.test"
+      ]
+    },
+    {
+      "reason": "FIXME: Each metadata query runs in its own server-side transaction on quack, so a reader that began before a concurrent TRUNCATE reads the post-truncate record counts from ducklake_table_stats.",
+      "paths": [
+        "test/sql/metadata/duckdb_tables_record_counts_concurrent.test"
+      ]
+    },
+    {
+      "reason": "FIXME: Each metadata query runs in its own server-side transaction on quack, so a reader that began before a rewrite reads the narrowed bounds from ducklake_table_column_stats.",
+      "paths": [
+        "test/sql/compaction/rewrite_narrow_older_transaction.test",
+        "test/sql/remove_files/remove_data_files_concurrent.test"
+      ]
+    },
+    {
+      "reason": "FIXME: Each metadata query runs in its own server-side transaction on quack, so an expiry in a transaction that began before a concurrent tag commit already sees the tag.",
+      "paths": [
+        "test/sql/tags/tags_expire_conflict.test"
+      ]
+    },
+    {
+      "reason": "Test relies on a file-based metadata catalog.",
+      "paths": [
+        "test/sql/general/default_path.test",
+        "test/sql/general/metadata_parameters.test",
+        "test/sql/remove_orphans/metadata_in_data_path.test"
+      ]
+    },
+    {
+      "reason": "Test requires the parquet extension to NOT be loaded.",
+      "paths": [
+        "test/sql/general/missing_parquet.test"
+      ]
+    },
+    {
+      "reason": "Memory-pressure test fails on commit.",
+      "paths": [
+        "test/sql/insert/insert_wide_table_low_memory.test_slow"
+      ]
+    },
+    {
+      "reason": "FIXME: Timeout was reached error for HTTP POST to http://localhost:19999/quack",
+      "paths": [
+        "test/sql/deletion_inlining/test_multiple_files_flush.test_slow"
+      ]
+    },
+    {
+      "reason": "FIXME: Flaky timeout on quack.",
+      "paths": [
+        "test/sql/alter/many_schema_versions_low_memory.test_slow"
+      ]
+    },
+    {
+      "reason": "FIXME: Not implemented Error: Multiple streaming scans or streaming scans + CTAS / insert in the same query are not currently supported",
+      "paths": [
+        "test/sql/sorted_table/set_sorted_by_idempotent.test"
+      ]
+    },
+    {
+      "reason": "Server-side quack commits serialize, so concurrent commits never exhaust the client retry budget these tests assert on.",
+      "paths": [
+        "test/sql/retry/commit_failure.test",
+        "test/sql/settings/max_retry_count.test"
+      ]
+    },
+    {
+      "reason": "The commit batch of a quack catalog is sent through quack_query_by_name, so the number of column inserts cannot be counted",
+      "paths": [
+        "test/sql/issues/issue_1146_column_insert_batches.test"
+      ]
+    },
+    {
+      "reason": "A quack catalog commits each statement, so its commits keep sending inlined rows as SQL text",
+      "paths": [
+        "test/sql/data_inlining/inlined_commit_append.test"
+      ]
+    },
+    {
+      "reason": "Quack expires snapshots when the transaction commits, so a cleanup in that transaction finds none of their files and a concurrent commit keeps the expiry",
+      "paths": [
+        "test/sql/cleanup/expire_cleanup_in_transaction.test",
+        "test/sql/cleanup/expire_cleanup_concurrent_commit.test"
+      ]
+    },
+    {
+      "reason": "The commit batch of a quack catalog is sent through quack_query_by_name, so the client log holds no delete file event insert to count",
+      "paths": [
+        "test/sql/delete/delete_replacement_commit_statements.test"
+      ]
+    },
+    {
+      "reason": "The conflict read of a server side quack commit runs in the sidecar, so the client log never shows it",
+      "paths": [
+        "test/sql/retry/retry_conflict_read_shapes.test"
+      ]
+    },
+    {
+      "reason": "A data-only commit of a quack catalog runs on the server, so the client log never shows the metadata reads it makes",
+      "paths": [
+        "test/sql/stats/stats_reads_filter_table.test",
+        "test/sql/stats/null_first_bounds_unrelated_commits.test"
+      ]
+    }
+  ]
+}

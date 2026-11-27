@@ -9,6 +9,8 @@
 #pragma once
 
 #include "storage/ducklake_insert.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "storage/ducklake_delete_filter.hpp"
 #include "storage/ducklake_metadata_info.hpp"
 #include "common/ducklake_data_file.hpp"
@@ -17,6 +19,7 @@ namespace duckdb {
 class DuckLakeTableEntry;
 class DuckLakeDeleteGlobalState;
 class DuckLakeTransaction;
+class MultiFileList;
 
 //! A deletion position with the snapshot ID from which it became valid
 struct PositionWithSnapshot {
@@ -28,30 +31,22 @@ struct PositionWithSnapshot {
 	}
 };
 
-inline void MergeDeletesWithSnapshots(const DeleteFileScanResult &scan_result, idx_t fallback_snapshot,
-                                      set<PositionWithSnapshot> &result) {
-	for (idx_t i = 0; i < scan_result.deleted_rows.size(); i++) {
-		PositionWithSnapshot pos_with_snap;
-		pos_with_snap.position = static_cast<int64_t>(scan_result.deleted_rows[i]);
-		if (scan_result.has_embedded_snapshots) {
-			pos_with_snap.snapshot_id = static_cast<int64_t>(scan_result.snapshot_ids[i]);
-		} else {
-			pos_with_snap.snapshot_id = static_cast<int64_t>(fallback_snapshot);
-		}
-		result.insert(pos_with_snap);
+inline idx_t MaxSnapshotId(const set<PositionWithSnapshot> &positions) {
+	idx_t result = 0;
+	for (auto &pos : positions) {
+		result = MaxValue(result, static_cast<idx_t>(pos.snapshot_id));
 	}
+	return result;
 }
 
-inline void MergeDeletesWithSnapshots(const DuckLakeDeleteData &delete_data, idx_t fallback_snapshot,
-                                      set<PositionWithSnapshot> &result) {
-	for (idx_t i = 0; i < delete_data.deleted_rows.size(); i++) {
+template <class T>
+void MergeDeletesWithSnapshots(const T &deletes, idx_t fallback_snapshot, set<PositionWithSnapshot> &result) {
+	bool has_snapshots = !deletes.snapshot_ids.empty();
+	for (idx_t i = 0; i < deletes.deleted_rows.size(); i++) {
 		PositionWithSnapshot pos_with_snap;
-		pos_with_snap.position = static_cast<int64_t>(delete_data.deleted_rows[i]);
-		if (delete_data.HasEmbeddedSnapshots()) {
-			pos_with_snap.snapshot_id = static_cast<int64_t>(delete_data.snapshot_ids[i]);
-		} else {
-			pos_with_snap.snapshot_id = static_cast<int64_t>(fallback_snapshot);
-		}
+		pos_with_snap.position = static_cast<int64_t>(deletes.deleted_rows[i]);
+		auto snapshot_id = has_snapshots ? deletes.snapshot_ids[i] : fallback_snapshot;
+		pos_with_snap.snapshot_id = static_cast<int64_t>(snapshot_id);
 		result.insert(pos_with_snap);
 	}
 }
@@ -82,6 +77,16 @@ struct DuckLakeDeleteFileWriter {
 	                                                       WriteDeleteFileWithSnapshotsInput &input);
 	//! Write a deletion vector file (puffin format) instead of a parquet delete file
 	static DuckLakeDeleteFile WriteDeletionVectorFile(ClientContext &context, WriteDeleteFileInput &input);
+	//! Write a puffin file with one cumulative deletion vector blob per snapshot
+	static DuckLakeDeleteFile WriteDeletionVectorFileWithSnapshots(ClientContext &context,
+	                                                               WriteDeleteFileWithSnapshotsInput &input);
+	//! Write a puffin deletion vector or a parquet delete file depending on use_deletion_vectors
+	static DuckLakeDeleteFile Write(ClientContext &context, WriteDeleteFileInput &input, bool use_deletion_vectors);
+	static DuckLakeDeleteFile Write(ClientContext &context, WriteDeleteFileWithSnapshotsInput &input,
+	                                bool use_deletion_vectors);
+	//! Rewrite the file if its new deletes are not dated to the commit snapshot
+	static void SetCommitSnapshot(ClientContext &context, DuckLakeTransaction &transaction,
+	                              DuckLakeDeleteFile &delete_file, idx_t commit_snapshot);
 };
 
 struct DuckLakeDeleteMap {
@@ -90,21 +95,7 @@ struct DuckLakeDeleteMap {
 		file_map.emplace(std::move(filename), std::move(file_entry));
 	}
 
-	DuckLakeFileListExtendedEntry GetExtendedFileInfo(const string &filename) {
-		auto delete_entry = file_map.find(filename);
-		if (delete_entry == file_map.end()) {
-			throw InternalException("Could not find matching file for written delete file");
-		}
-		return delete_entry->second;
-	}
-
-	optional_ptr<DuckLakeFileListExtendedEntry> TryGetExtendedFileInfo(const string &filename) {
-		auto delete_entry = file_map.find(filename);
-		if (delete_entry == file_map.end()) {
-			return nullptr;
-		}
-		return &delete_entry->second;
-	}
+	DuckLakeFileListExtendedEntry GetExtendedFileInfo(const string &filename);
 
 	optional_ptr<DuckLakeDeleteData> GetDeleteData(const string &filename) {
 		lock_guard<mutex> guard(lock);
@@ -124,6 +115,9 @@ struct DuckLakeDeleteMap {
 		lock_guard<mutex> guard(lock);
 		delete_data_map.emplace(filename, std::move(delete_data));
 	}
+
+	//! The file lists of the scans, read again for a file that a concurrent flush or compaction added to a scan
+	vector<shared_ptr<MultiFileList>> file_lists;
 
 private:
 	mutex lock;
@@ -190,12 +184,6 @@ private:
 	                              const DuckLakeFileListExtendedEntry &data_file_info,
 	                              DuckLakeDeleteData &existing_delete_data, const set<idx_t> &sorted_deletes,
 	                              DuckLakeDeleteFile &delete_file) const;
-	//! Merge existing + new deletes into a single deletion vector (puffin) file
-	void FlushMergedDeletionVector(DuckLakeTransaction &transaction, ClientContext &context,
-	                               DuckLakeDeleteGlobalState &global_state, const string &filename,
-	                               const DuckLakeFileListExtendedEntry &data_file_info,
-	                               DuckLakeDeleteData &existing_delete_data, const set<idx_t> &sorted_deletes,
-	                               DuckLakeDeleteFile &delete_file) const;
 	//! Try to drop a file if all rows are deleted. Returns true if the file was dropped.
 	bool TryDropFullyDeletedFile(DuckLakeTransaction &transaction, const DuckLakeDeleteFile &delete_file,
 	                             const DuckLakeFileListExtendedEntry &data_file_info, idx_t delete_count) const;

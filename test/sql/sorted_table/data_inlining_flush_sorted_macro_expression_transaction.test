@@ -7,11 +7,11 @@ require ducklake
 require parquet
 
 
-test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
 
 
 statement ok
-ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '__TEST_DIR__/merge_adjacent_sorted_macro_expression_transaction/', DATA_INLINING_ROW_LIMIT 10)
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{TEST_DIR}/merge_adjacent_sorted_macro_expression_transaction/', DATA_INLINING_ROW_LIMIT 10)
 
 statement ok
 USE ducklake;
@@ -72,36 +72,44 @@ ABC	XYZ	AXBYCZ
 321	000	302010
 123	000	102030
 
+# Delete positions must not rebind this transaction's sort macro on the metadata connection.
+statement ok
+DELETE FROM macro_sort_test WHERE i = '321'
+
 statement ok
 CALL ducklake_flush_inlined_data('ducklake', table_name => 'macro_sort_test');
 
-# Verify data is now sorted by the macro
 query III
 SELECT i, j, zip_varchar(i, j, num_chars := 3)
 FROM macro_sort_test
+ORDER BY zip_varchar(i, j, num_chars := 3)
 ----
 123	000	102030
-321	000	302010
 ABC	XYZ	AXBYCZ
 ZYX	CBA	ZCYBXA
 
-# We can even clear the sorting before committing
-statement ok 
+statement ok
 ALTER TABLE ducklake.macro_sort_test RESET SORTED BY
 
 statement ok
 COMMIT
 
-# Verify data is still sorted by the macro
 query III
 SELECT i, j, zip_varchar(i, j, num_chars := 3)
 FROM macro_sort_test
+ORDER BY zip_varchar(i, j, num_chars := 3)
 ----
 123	000	102030
-321	000	302010
 ABC	XYZ	AXBYCZ
 ZYX	CBA	ZCYBXA
 
 statement ok
 DROP MACRO zip_varchar
 
+query II
+SELECT i, j FROM macro_sort_test AT (VERSION => 2) ORDER BY i
+----
+123	000
+321	000
+ABC	XYZ
+ZYX	CBA

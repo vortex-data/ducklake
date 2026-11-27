@@ -1,0 +1,59 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// metadata_manager/quack_metadata_manager.hpp
+//
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "storage/ducklake_metadata_manager.hpp"
+
+namespace duckdb {
+
+class QuackMetadataManager : public DuckLakeMetadataManager {
+public:
+	explicit QuackMetadataManager(DuckLakeTransaction &transaction);
+
+	static unique_ptr<DuckLakeMetadataManager> Create(DuckLakeTransaction &transaction) {
+		return make_uniq<QuackMetadataManager>(transaction);
+	}
+
+	bool SupportsAppender() const override {
+		return false;
+	}
+	bool DroppedTablesStayReadable() const override {
+		return false;
+	}
+	bool CommitsEachStatement() const override {
+		return true;
+	}
+	void ProbeServerCapabilities() override;
+	bool ProbeMetadataColumns() override;
+	bool CanSkipSnapshotFetch(const TransactionChangeInformation &changes) const override;
+	void FlushChangesServerSide(DuckLakeTransaction &transaction, DuckLakeSnapshot transaction_snapshot,
+	                            const TransactionChangeInformation &transaction_changes,
+	                            const DuckLakeRetryConfig &retry_config) override;
+	using DuckLakeMetadataManager::Query;
+	unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string &query) override;
+	unique_ptr<QueryResult> ExecuteInTransaction(string &query) override;
+	unique_ptr<QueryResult> Query(string &query) override;
+	unique_ptr<QueryResult> AttachMetadata(const string &attach_query) override;
+	void ClearCache() override;
+
+	bool MetadataExists() override;
+	bool ListsInlinedDeletionTables() const override {
+		return true;
+	}
+	unordered_set<string> ListInlinedDeletionTables() override;
+
+protected:
+	string MetadataExistsQuery() const override;
+	string SnapshotTimeSql() const override {
+		// the server's clock, the commit batch runs in a new server transaction
+		return "NOW()";
+	}
+};
+
+} // namespace duckdb

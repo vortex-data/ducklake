@@ -30,7 +30,7 @@ INSERT INTO ducklake.t VALUES (4, 'd', 4.5, [4])
 # both writes recorded as vortex, with real row counts and file sizes
 query III
 SELECT file_format, SUM(record_count), bool_and(file_size_bytes > 0)
-FROM ducklake_meta.ducklake_data_file WHERE end_snapshot IS NULL GROUP BY file_format
+FROM ducklake_meta.ducklake_data_file GROUP BY file_format
 ----
 vortex	4	true
 
@@ -93,7 +93,7 @@ CREATE TABLE ducklake.ctas AS SELECT range AS r, range * 2 AS r2 FROM range(1000
 query I
 SELECT DISTINCT file_format FROM ducklake_meta.ducklake_data_file d
     JOIN ducklake_meta.ducklake_table t USING (table_id)
-WHERE t.table_name = 'ctas' AND d.end_snapshot IS NULL
+WHERE t.table_name = 'ctas'
 ----
 vortex
 

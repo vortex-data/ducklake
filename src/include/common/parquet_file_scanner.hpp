@@ -13,6 +13,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 #include "storage/ducklake_metadata_info.hpp"
 
 namespace duckdb {
@@ -20,16 +21,14 @@ namespace duckdb {
 //! Utility class for scanning parquet files directly
 class ParquetFileScanner {
 public:
-	ParquetFileScanner(ClientContext &context, const DuckLakeFileData &file);
-	ParquetFileScanner(ClientContext &context, const DuckLakeFileData &file,
-	                   table_function_get_multi_file_reader_t multi_file_reader_creator,
-	                   shared_ptr<TableFunctionInfo> function_info = nullptr);
+	//! use_file_metadata avoids a HEAD request
+	ParquetFileScanner(ClientContext &context, const DuckLakeFileData &file, bool use_file_metadata = false);
 
 	const vector<LogicalType> &GetTypes() const;
-	const vector<string> &GetNames() const;
+	const vector<Identifier> &GetNames() const;
 
 	//! Find a column by name, returns invalid index if not found
-	optional_idx FindColumn(const string &name) const;
+	optional_idx FindColumn(const Identifier &name) const;
 
 	//! Set filters to push down to the scan
 	void SetFilters(unique_ptr<TableFilterSet> filters);
@@ -43,12 +42,14 @@ public:
 	//! Scan the next chunk. Returns false when done.
 	bool Scan(DataChunk &chunk);
 
+	static Value EncryptionConfig(const string &encryption_key);
+
 private:
 	ClientContext &context;
 	TableFunction parquet_scan;
 	unique_ptr<FunctionData> bind_data;
 	vector<LogicalType> return_types;
-	vector<string> return_names;
+	vector<Identifier> return_names;
 
 	unique_ptr<TableFilterSet> filters;
 	vector<column_t> column_ids;

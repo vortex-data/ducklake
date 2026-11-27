@@ -6,13 +6,13 @@ require ducklake
 
 require parquet
 
-test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
 
-test-env DATA_PATH __TEST_DIR__
+test-env DATA_PATH {TEST_DIR}
 
 
 statement ok
-ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_multi_deletes_files')
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/ducklake_multi_deletes_files')
 
 statement ok
 CREATE TABLE ducklake.test AS SELECT i id FROM range(10000) t(i);
@@ -51,7 +51,7 @@ SELECT COUNT(*), SUM(id) FROM ducklake.test
 
 # verify that we only have one delete file written after the commit (i.e. we cleaned up the first file)
 query I
-SELECT COUNT(*) FROM glob('${DATA_PATH}/ducklake_multi_deletes_files/main/test/*-delete.*')
+SELECT COUNT(*) FROM glob('{DATA_PATH}/ducklake_multi_deletes_files/main/test/*-delete.*')
 ----
 1
 
@@ -68,7 +68,7 @@ SELECT COUNT(*), SUM(id) FROM ducklake.test
 
 # Let's check the new file is properly consolidated
 query II
-SELECT begin_snapshot, end_snapshot FROM __ducklake_metadata_ducklake.ducklake_delete_file
+SELECT begin_snapshot, end_snapshot FROM (SELECT f.*, v.begin_snapshot, v.end_snapshot FROM __ducklake_metadata_ducklake.ducklake_delete_file f JOIN (SELECT delete_file_id, MAX(CASE WHEN is_delete = FALSE THEN snapshot_id END) begin_snapshot, MAX(CASE WHEN is_delete = TRUE THEN snapshot_id END) end_snapshot FROM __ducklake_metadata_ducklake.ducklake_delete_file_visibility WHERE branch_id = 0 GROUP BY delete_file_id) v ON v.delete_file_id = f.delete_file_id)
 ----
 2	NULL
 

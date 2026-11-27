@@ -1,0 +1,148 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// storage/ducklake_commit_state.hpp
+//
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "common/ducklake_data_file.hpp"
+#include "common/ducklake_snapshot.hpp"
+#include "common/index.hpp"
+#include "storage/ducklake_metadata_info.hpp"
+#include "storage/ducklake_schema_entry.hpp"
+#include "storage/ducklake_table_entry.hpp"
+#include "storage/ducklake_view_entry.hpp"
+
+namespace duckdb {
+
+//! The fields a commit adds to a table
+struct DuckLakeAddedFields {
+	TableIndex table_id;
+	reference<const DuckLakeTableEntry> table;
+	set<FieldIndex> fields;
+};
+
+struct NewTableInfo {
+	vector<DuckLakeAddedFields> added_fields;
+	vector<DuckLakeTableInfo> new_tables;
+	vector<DuckLakeViewInfo> new_views;
+	vector<DuckLakePartitionInfo> new_partition_keys;
+	vector<DuckLakeTagInfo> new_tags;
+	vector<DuckLakeColumnTagInfo> new_column_tags;
+	vector<DuckLakeViewColumnTagInfo> new_view_column_tags;
+	vector<DuckLakeDroppedColumn> dropped_columns;
+	vector<DuckLakeNewColumn> new_columns;
+	vector<DuckLakeNewColumn> dropped_new_columns;
+	vector<DuckLakeTableInfo> new_inlined_data_tables;
+	vector<DuckLakeSortInfo> new_sort_keys;
+	vector<DuckLakeConfigOption> new_table_options;
+};
+
+struct NewMacroInfo {
+	vector<DuckLakeMacroInfo> new_macros;
+};
+
+struct NewNameMapInfo {
+	vector<DuckLakeColumnMappingInfo> new_column_mappings;
+};
+
+struct NewDataInfo {
+	vector<DuckLakeFileInfo> new_files;
+	vector<DuckLakeInlinedDataInfo> new_inlined_data;
+};
+
+struct CompactionInformation {
+	vector<DuckLakeCompactedFileInfo> compacted_files;
+	vector<DuckLakeFileInfo> new_files;
+};
+
+struct DuckLakeCommitState {
+	explicit DuckLakeCommitState(DuckLakeSnapshot &snapshot) : commit_snapshot(snapshot) {
+	}
+
+	DuckLakeSnapshot &commit_snapshot;
+	map<SchemaIndex, SchemaIndex> committed_schemas;
+	map<TableIndex, TableIndex> committed_tables;
+	map<idx_t, idx_t> committed_partition_ids;
+	map<MappingIndex, MappingIndex> committed_mapping_indexes;
+	map<TableIndex, vector<DuckLakeDeleteFile>> local_delete_files;
+	//! The columns this commit widens from FLOAT to DOUBLE
+	map<TableIndex, set<FieldIndex>> float_widened_columns;
+	//! The widened columns with values that read as DOUBLE without FLOAT rounding
+	map<TableIndex, set<FieldIndex>> float_bounds_to_clear;
+	//! The columns this commit retypes to a finer timestamp unit
+	map<TableIndex, set<FieldIndex>> refined_timestamp_columns;
+	//! The columns of a created table whose files hold a type the replaced version row no longer records
+	map<TableIndex, set<FieldIndex>> retyped_created_columns;
+	//! Whether a created table's columns are written once, as a 2.0 row has one version per birth
+	bool supports_row_visibility = false;
+	//! The oid of each entry that gets its id in this commit
+	ducklake_entry_oids_t new_entry_oids;
+	//! The existing tables that get a new inlined data table in this commit
+	set<TableIndex> replaced_inlined_tables;
+
+	void AddNewEntry(const CatalogEntry &entry, idx_t id) {
+		new_entry_oids.emplace(make_pair(entry.type, id), entry.oid);
+	}
+
+	//! Whether this commit widens a column of the given table from FLOAT to DOUBLE
+	bool WidensFloatColumns(TableIndex table_id) const;
+	//! Drop the bounds of a retyped column of a created table, no version row shows the type its files hold
+	void ClearRetypedCreatedBounds(TableIndex table_id, map<FieldIndex, DuckLakeColumnStats> &column_stats) const;
+	//! Widen the FLOAT bounds of a widened column, or clear them when they cannot be widened
+	void PrepareFloatBounds(TableIndex table_id, map<FieldIndex, DuckLakeColumnStats> &column_stats,
+	                        bool can_widen = true) const;
+
+	void RemapIdentifier(SchemaIndex &schema_id) const {
+		auto entry = committed_schemas.find(schema_id);
+		if (entry != committed_schemas.end()) {
+			schema_id = entry->second;
+		}
+	}
+	void RemapIdentifier(TableIndex &table_id) const {
+		auto entry = committed_tables.find(table_id);
+		if (entry != committed_tables.end()) {
+			table_id = entry->second;
+		}
+	}
+	void RemapPartitionId(optional_idx &partition_id) const {
+		if (!partition_id.IsValid()) {
+			return;
+		}
+		auto entry = committed_partition_ids.find(partition_id.GetIndex());
+		if (entry != committed_partition_ids.end()) {
+			partition_id = entry->second;
+		}
+	}
+	void RemapMappingIndex(MappingIndex &table_id) const {
+		auto entry = committed_mapping_indexes.find(table_id);
+		if (entry != committed_mapping_indexes.end()) {
+			table_id = entry->second;
+		}
+	}
+
+	SchemaIndex GetSchemaId(DuckLakeSchemaEntry &schema) const {
+		auto schema_id = schema.GetSchemaId();
+		RemapIdentifier(schema_id);
+		return schema_id;
+	}
+	TableIndex GetTableId(DuckLakeTableEntry &table) const {
+		auto table_id = table.GetTableId();
+		RemapIdentifier(table_id);
+		return table_id;
+	}
+	TableIndex GetTableId(TableIndex table_id) const {
+		RemapIdentifier(table_id);
+		return table_id;
+	}
+	TableIndex GetViewId(DuckLakeViewEntry &view) const {
+		auto view_id = view.GetViewId();
+		RemapIdentifier(view_id);
+		return view_id;
+	}
+};
+
+} // namespace duckdb

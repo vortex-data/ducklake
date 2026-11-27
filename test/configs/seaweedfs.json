@@ -1,0 +1,71 @@
+{
+  "description": "Run DuckLake tests using SeaweedFS.",
+  "on_init": "SET httpfs_client_implementation='httplib'; CREATE SECRET (TYPE S3, KEY_ID 'admin', SECRET 'password', ENDPOINT '127.0.0.1:9000', URL_STYLE 'path', USE_SSL 0);",
+  "test_env": [{
+      "env_name":  "DATA_PATH",
+      "env_value": "s3://mybucket"
+   }],
+  "skip_error_messages": ["this_is_not_allowed_to_be_empty"],
+  "statically_loaded_extensions": [
+    "core_functions",
+    "parquet",
+    "icu",
+    "httpfs",
+    "json"
+  ],   "skip_tests": [
+   {
+      "reason": "Secret storage resolution is independent of the catalog backend and is covered under the default config",
+      "paths": [
+        "test/sql/secrets/ducklake_secret_storages.test"
+      ]
+    },
+   {
+      "reason": "Extension Loading tests, not relevant to remote files.",
+      "paths": [
+        "test/sql/general/missing_parquet.test",
+        "test/sql/autoloading/autoload_data_path.test",
+        "test/sql/add_files/add_files_json_without_extension.test"
+      ]
+    },
+  {
+      "reason": "Test with a hardcoded file path.",
+      "paths": [
+        "test/sql/add_files/add_old_list.test",
+        "test/sql/migration/migration.test",
+        "test/sql/migration/per_table_schema.test",
+        "test/sql/migration/v01_partitioned.test",
+        "test/sql/delete/delete_ignore_extra_columns.test",
+        "test/sql/add_files/add_file_with_three_level_list.test",
+        "test/sql/migration/test_compaction.test",
+        "test/sql/remove_orphans/metadata_in_data_path.test",
+        "test/sql/issues/issue_1295_add_files_no_null_count.test"
+      ]
+    },
+    {
+      "reason": "Tests a local file system path spelling that object store keys keep literally.",
+      "paths": [
+        "test/sql/remove_orphans/non_canonical_data_path.test"
+      ]
+    },
+    {
+      "reason": "Tests ObjectCache eviction under a tight memory_limit; S3 multipart upload part buffers (~80MB each) exceed the memory_limit required for the eviction scenario.",
+      "paths": [
+        "test/sql/insert/insert_wide_table_low_memory.test_slow"
+      ]
+    },
+    {
+      "reason": "Test only for Postgres as catalog",
+      "paths": [
+        "test/sql/benchmark/postgres_catalog.test",
+        "test/sql/metadata/metadata_schema_scoped_attach.test"
+      ]
+    },
+    {
+      "reason": "Overwrites a delete file in place, while DuckLake caches remote files on the assumption that they never change.",
+      "paths": [
+        "test/sql/delete/delete_file_corrupt.test",
+        "test/sql/table_changes/ducklake_table_deletions_corrupt_delete_file.test"
+      ]
+    }
+  ]
+}

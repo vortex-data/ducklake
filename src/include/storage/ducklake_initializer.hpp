@@ -9,6 +9,7 @@
 #pragma once
 
 #include "storage/ducklake_catalog.hpp"
+#include "common/ducklake_version.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/connection.hpp"
 
@@ -25,14 +26,23 @@ public:
 private:
 	void InitializeNewDuckLake(DuckLakeTransaction &transaction, bool has_explicit_schema);
 	void LoadExistingDuckLake(DuckLakeTransaction &transaction);
+	//! Loads an existing DuckLake, retrying when another attach migrates it at the same time
+	void LoadExistingDuckLakeWithRetries(DuckLakeTransaction &transaction);
+	void AttachMetadata(DuckLakeTransaction &transaction);
+	void RestartMetadataTransaction(DuckLakeTransaction &transaction);
+	bool DuckLakeIsInitialized(DuckLakeTransaction &transaction);
 	void InitializeDataPath();
 	string GetAttachOptions();
-	void CheckAndAutoloadedRequiredExtension(const string &pattern);
+	void SetVersionedMetadataManager(DuckLakeTransaction &transaction, DuckLakeVersion version);
+	DuckLakeVersion ResolveTargetVersion(DuckLakeVersion catalog_version, const string &catalog_version_str);
 
 private:
 	ClientContext &context;
 	DuckLakeCatalog &catalog;
 	DuckLakeOptions &options;
+	bool migrating = false;
+	//! Whether creation, migration, or catalog reuse requires clearing the metadata cache.
+	bool metadata_cache_stale = false;
 };
 
 } // namespace duckdb

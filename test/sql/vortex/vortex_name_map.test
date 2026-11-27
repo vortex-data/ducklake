@@ -31,7 +31,6 @@ COPY (SELECT i, s FROM ducklake.t ORDER BY i) TO '{TEST_DIR}/nm.vortex' (FORMAT 
 statement ok
 UPDATE ducklake_meta.ducklake_data_file
 SET path = '{TEST_DIR}/nm.vortex', path_is_relative = false, file_format = 'vortex'
-WHERE end_snapshot IS NULL
 
 # rename s -> s2: the file still has physical name 's'
 statement ok
@@ -45,7 +44,7 @@ statement ok
 INSERT INTO ducklake_meta.ducklake_name_mapping VALUES (100, 1, 'i', 1, NULL, false), (100, 2, 's', 2, NULL, false)
 
 statement ok
-UPDATE ducklake_meta.ducklake_data_file SET mapping_id = 100 WHERE end_snapshot IS NULL
+UPDATE ducklake_meta.ducklake_data_file SET mapping_id = 100
 
 statement ok
 DETACH ducklake

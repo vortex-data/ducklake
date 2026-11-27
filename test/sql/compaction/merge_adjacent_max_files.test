@@ -6,12 +6,14 @@ require ducklake
 
 require parquet
 
-test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+require notmusl
 
-test-env DATA_PATH __TEST_DIR__
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
 
 statement ok
-ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/merge_adjacent_max_files/', DATA_INLINING_ROW_LIMIT 0)
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/merge_adjacent_max_files/', DATA_INLINING_ROW_LIMIT 0)
 
 statement ok
 USE ducklake;
@@ -23,7 +25,7 @@ CREATE TABLE example (key integer);
 loop i 0 20
 
 statement ok
-INSERT INTO example VALUES (${i});
+INSERT INTO example VALUES ({i});
 
 endloop
 
@@ -54,7 +56,7 @@ CREATE TABLE example (key integer);
 loop i 0 20
 
 statement ok
-INSERT INTO example VALUES (${i});
+INSERT INTO example VALUES ({i});
 
 endloop
 
@@ -66,7 +68,7 @@ SELECT count(*) FROM __ducklake_metadata_ducklake.ducklake_data_file
 statement error
 CALL ducklake_merge_adjacent_files('ducklake', 'example', max_compacted_files=>-1);
 ----
-Type INT32 with value -1 can't be cast
+The max_compacted_files option must be greater than zero.
 
 statement error
 CALL ducklake_merge_adjacent_files('ducklake', 'example', max_compacted_files=>NULL);
@@ -149,10 +151,10 @@ CREATE TABLE table2 (key integer);
 loop i 0 10
 
 statement ok
-INSERT INTO table1 VALUES (${i});
+INSERT INTO table1 VALUES ({i});
 
 statement ok
-INSERT INTO table2 VALUES (${i});
+INSERT INTO table2 VALUES ({i});
 
 endloop
 

@@ -9,7 +9,12 @@
 #pragma once
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "storage/ducklake_catalog_set.hpp"
+#include "storage/ducklake_partition_data.hpp"
+#include "storage/ducklake_sort_data.hpp"
 
 namespace duckdb {
 class DuckLakeTransaction;
@@ -18,12 +23,20 @@ struct DefaultTableMacro;
 class DuckLakeSchemaEntry : public SchemaCatalogEntry {
 public:
 	DuckLakeSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, SchemaIndex schema_id, string schema_uuid,
-	                    string data_path);
+	                    string data_path, optional_ptr<DuckLakeSchemaEntry> parent_schema = nullptr);
+	~DuckLakeSchemaEntry() override;
 
 public:
 	SchemaIndex GetSchemaId() const {
 		return schema_id;
 	}
+	optional_ptr<DuckLakeSchemaEntry> ParentDuckLakeSchema() const {
+		auto parent = GetParentSchema();
+		return parent ? &parent->Cast<DuckLakeSchemaEntry>() : nullptr;
+	}
+	void SetParentSchema(DuckLakeSchemaEntry &parent);
+	const string &PathKey() const;
+	static string ChildPathKey(optional_ptr<const DuckLakeSchemaEntry> parent, const Identifier &name);
 	const string &GetSchemaUUID() const {
 		return schema_uuid;
 	}
@@ -32,51 +45,60 @@ public:
 	}
 
 public:
+	//! Create + register a DuckLakeTableEntry; prebuilt_* specs are supplied by CTAS.
 	optional_ptr<CatalogEntry> CreateTableExtended(CatalogTransaction transaction, BoundCreateTableInfo &info,
-	                                               string table_uuid, string table_data_path);
+	                                               string table_uuid, string table_data_path,
+	                                               unique_ptr<DuckLakePartition> prebuilt_partition_data = nullptr,
+	                                               unique_ptr<DuckLakeSort> prebuilt_sort_data = nullptr,
+	                                               map<string, string> prebuilt_table_options = {},
+	                                               vector<Value> initial_defaults = {});
+	//! Data path for a new table in this schema, derived from the schema path, table name and uuid
+	string GenerateTableDataPath(const string &table_uuid, const string &table_name) const;
+	unique_ptr<CreateInfo> GetInfo() const override;
 	optional_ptr<CatalogEntry> CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) override;
 	optional_ptr<CatalogEntry> CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) override;
 	optional_ptr<CatalogEntry> CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,
 	                                       TableCatalogEntry &table) override;
 	optional_ptr<CatalogEntry> CreateView(CatalogTransaction transaction, CreateViewInfo &info) override;
+	//! Creates a view with the given uuid, a new one if it is empty
+	optional_ptr<CatalogEntry> CreateViewExtended(CatalogTransaction transaction, CreateViewInfo &info,
+	                                              string view_uuid);
 	optional_ptr<CatalogEntry> CreateSequence(CatalogTransaction transaction, CreateSequenceInfo &info) override;
-	optional_ptr<CatalogEntry> CreateTableFunction(CatalogTransaction transaction,
-	                                               CreateTableFunctionInfo &info) override;
-	optional_ptr<CatalogEntry> CreateCopyFunction(CatalogTransaction transaction,
-	                                              CreateCopyFunctionInfo &info) override;
-	optional_ptr<CatalogEntry> CreatePragmaFunction(CatalogTransaction transaction,
-	                                                CreatePragmaFunctionInfo &info) override;
-	optional_ptr<CatalogEntry> CreateCollation(CatalogTransaction transaction, CreateCollationInfo &info) override;
 	optional_ptr<CatalogEntry> CreateType(CatalogTransaction transaction, CreateTypeInfo &info) override;
 	void Alter(CatalogTransaction transaction, AlterInfo &info) override;
 	void Scan(ClientContext &context, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
 	void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
 	void DropEntry(ClientContext &context, DropInfo &info) override;
+	//! Drops an entry, a replaced one without checking for tables that call it
+	void DropEntry(ClientContext &context, DropInfo &info, bool replacing);
+	//! Throws if a table calls one of the macros in its defaults or sort key
+	static void ThrowIfTablesCallMacros(ClientContext &context, Catalog &catalog, const identifier_set_t &macro_names);
 	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) override;
-	SimilarCatalogEntry GetSimilarEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) override;
 
 	void AddEntry(CatalogType type, unique_ptr<CatalogEntry> entry);
-	void TryDropSchema(DuckLakeTransaction &transaction, bool cascade);
+	void TryDropSchema(CatalogTransaction transaction, bool cascade);
 
 	static bool CatalogTypeIsSupported(CatalogType type);
 
 private:
 	DuckLakeCatalogSet &GetCatalogSet(CatalogType type);
-	bool HandleCreateConflict(CatalogTransaction transaction, CatalogType type, const string &name,
-	                          OnCreateConflict on_conflict);
+	bool HandleCreateConflict(CatalogTransaction transaction, CatalogType type, const Identifier &name,
+	                          CreateInfo &info);
 
-	optional_ptr<CatalogEntry> TryLoadBuiltInFunction(const string &entry_name);
+	optional_ptr<CatalogEntry> TryLoadBuiltInFunction(const Identifier &entry_name);
 	optional_ptr<CatalogEntry> LoadBuiltInFunction(DefaultTableMacro macro);
 
 private:
 	SchemaIndex schema_id;
 	string schema_uuid;
 	string data_path;
+	string path_key;
+	DuckLakeCatalogSet child_schemas;
 	DuckLakeCatalogSet tables;
 	DuckLakeCatalogSet scalar_macros;
 	DuckLakeCatalogSet table_macros;
 	mutex default_function_lock;
-	case_insensitive_map_t<unique_ptr<CatalogEntry>> default_function_map;
+	identifier_map_t<unique_ptr<CatalogEntry>> default_function_map;
 };
 
 } // namespace duckdb

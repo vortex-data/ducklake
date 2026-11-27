@@ -46,6 +46,7 @@ struct DuckLakeDeleteFile {
 	idx_t delete_count;
 	idx_t file_size_bytes;
 	idx_t footer_size;
+	optional_idx row_group_count;
 	string encryption_key;
 	bool overwrites_existing_delete = false;
 	//! The old delete file being overwritten (for deletion from metadata and disk)
@@ -54,19 +55,21 @@ struct DuckLakeDeleteFile {
 	//! Optional max_snapshot information for partial deletion files.
 	optional_idx max_snapshot;
 	DeleteFileSource source = DeleteFileSource::REGULAR;
+
+	//! Whether the new deletes are dated to max_snapshot, which has to be the commit snapshot
+	bool DatesNewDeletes() const {
+		return source == DeleteFileSource::REGULAR && max_snapshot.IsValid();
+	}
 };
 
 struct DuckLakeDataFile {
-	DuckLakeDataFile() = default;
-	DuckLakeDataFile(const DuckLakeDataFile &other);
-	DuckLakeDataFile &operator=(const DuckLakeDataFile &);
-
 	string file_name;
 	//! physical format ("parquet", "vortex", ...); recorded in ducklake_data_file.file_format
 	string file_format = "parquet";
 	idx_t row_count;
 	idx_t file_size_bytes;
 	optional_idx footer_size;
+	optional_idx row_group_count;
 	optional_idx partition_id;
 	vector<DuckLakeDeleteFile> delete_files;
 	map<FieldIndex, DuckLakeColumnStats> column_stats;

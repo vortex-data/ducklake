@@ -1,0 +1,262 @@
+{
+  "description": "Run on DuckLake database as storage with ducklake_default_version set to 1.0.",
+  "on_init": "SET ducklake_default_version = '1.0';",
+  "statically_loaded_extensions": [
+    "core_functions",
+    "parquet",
+    "ducklake",
+    "icu"
+  ],
+  "skip_tests": [
+    {
+      "reason": "The stats exactness columns do not exist in a DuckLake 1.0 catalog",
+      "paths": [
+        "test/sql/remove_files/remove_data_files_stats.test"
+      ]
+    },
+    {
+      "reason": "Parquet is statically loaded in this config, test requires missing parquet",
+      "paths": [
+        "test/sql/general/missing_parquet.test"
+      ]
+    },
+    {
+      "reason": "This test exercises the ducklake_version feature directly and assumes no global default is set",
+      "paths": [
+        "test/sql/add_files/add_files_stats_exactness.test",
+        "test/sql/attach/attach_ducklake_version.test",
+        "test/sql/migration/v11_dev1_to_v11.test",
+        "test/sql/migration/v20_dev1_new_catalog.test",
+        "test/sql/catalog/snapshot_branch_key.test",
+        "test/sql/migration/v20_dev1_missing_steps.test",
+        "test/sql/metadata/row_group_count.test",
+        "test/sql/metadata/sqlite_large_commit.test",
+        "test/sql/migration/v10_row_group_count.test",
+        "test/sql/migration/v11_stats_exactness.test",
+        "test/sql/partitioning/epoch_version_gate.test",
+        "test/sql/stats/stats_exactness_inlined.test",
+        "test/sql/types/null_type_version_gate.test",
+        "test/sql/macros/null_default_version_gate.test"
+      ]
+    },
+    {
+      "reason": "Snapshot tags need DuckLake 2.0 and are not available when ducklake_default_version is pinned to 1.0",
+      "paths": [
+        "test/sql/cleanup/expire_retry_keeps_tagged_files.test",
+        "test/sql/settings/set_option_concurrent_insert_expiry.test",
+        "test/sql/tags/tags_basic.test",
+        "test/sql/tags/tags_conflict.test",
+        "test/sql/tags/tags_expire.test",
+        "test/sql/tags/tags_expire_conflict.test",
+        "test/sql/tags/tags_expire_dropped.test",
+        "test/sql/tags/tags_expire_files.test",
+        "test/sql/tags/tags_expire_history.test",
+        "test/sql/tags/tags_expire_open_conflict.test",
+        "test/sql/tags/tags_expires_at.test",
+        "test/sql/tags/tags_expires_at_conflict.test",
+        "test/sql/tags/tags_expires_at_empty_selection.test",
+        "test/sql/tags/sqlite_wal_tags_expires_at.test",
+        "test/sql/tags/tags_parallel.test",
+        "test/sql/tags/tags_replace.test",
+        "test/sql/tags/tags_replace_conflict.test",
+        "test/sql/tags/sqlite_wal_tags_replace.test",
+        "test/sql/tags/tags_time_travel.test",
+        "test/sql/tags/tags_transaction.test",
+        "test/sql/tags/tags_row_collation.test"
+      ]
+    },
+    {
+      "reason": "Time travel by timestamp checks the expired_snapshot changes that expiries write from DuckLake 2.0 on, a catalog pinned to 1.0 writes none",
+      "paths": [
+        "test/sql/time_travel/at_timestamp_expired_snapshots.test",
+        "test/sql/time_travel/at_timestamp_expired_in_transaction.test"
+      ]
+    },
+    {
+      "reason": "Inlining VARIANT values into a SQLite or Postgres catalog needs 1.1 and is disabled when ducklake_default_version is pinned to 1.0",
+      "paths": [
+        "test/sql/data_inlining/data_inlining_variant_sql_rollback.test"
+      ]
+    },
+    {
+      "reason": "The NULL column type was added in 1.1 and is not available when ducklake_default_version is pinned to 1.0",
+      "paths": [
+        "test/sql/types/null_type.test",
+        "test/sql/alter/promote_null_type.test",
+        "test/sql/partitioning/partition_null_type.test",
+        "test/sql/data_inlining/data_inlining_null_type.test",
+        "test/sql/add_files/add_files_null_type.test",
+        "test/sql/macros/test_null_default.test",
+        "test/sql/macros/typed_null_default.test",
+        "test/sql/geo/null_to_geometry_promotion_stats.test",
+        "test/sql/rest/rest_null_type_column.test"
+      ]
+    },
+    {
+      "reason": "A macro parameter default that is a cast of a time zone type needs DuckLake 1.1 and is rejected when ducklake_default_version is pinned to 1.0",
+      "paths": [
+        "test/sql/macros/time_zone_macro_default.test"
+      ]
+    },
+    {
+      "reason": "The TIMESTAMPTZ_NS column type was added in 1.1 and is not available when ducklake_default_version is pinned to 1.0",
+      "paths": [
+        "test/sql/add_files/add_files_type_check_reader_types.test",
+        "test/sql/default/literal_default_rendering.test",
+        "test/sql/partitioning/partition_transform_column_types.test",
+        "test/sql/stats/filter_pushdown_postgres_types.test",
+        "test/sql/stats/timestamptz_retype_stats_time_zone.test",
+        "test/sql/stats/timestamptz_retype_topn_time_zone.test",
+        "test/sql/partitioning/calendar_timestamptz_ns.test",
+        "test/sql/types/timestamptz_ns_values.test"
+      ]
+    },
+    {
+      "reason": "Nested macro parameter types and defaults were added in 1.1 and are not available when ducklake_default_version is pinned to 1.0",
+      "paths": [
+        "test/sql/issues/issue_1116_nested_macro_parameters.test"
+      ]
+    },
+    {
+      "reason": "View column comments (ducklake_view_column_tag) were added in 1.1 and are not available when ducklake_default_version is pinned to 1.0",
+      "paths": [
+        "test/sql/comments/comment_on_view_column.test",
+        "test/sql/comments/comment_on_view_column_conflict.test",
+        "test/sql/comments/comment_on_view_column_invalid.test",
+        "test/sql/comments/comment_on_view_column_update.test",
+        "test/sql/comments/copy_database_view_column_comments.test",
+        "test/sql/comments/drop_view_expires_view_column_tags.test",
+        "test/sql/rest/rest_view_column_comment.test"
+      ]
+    },
+    {
+      "reason": "The _ducklake_ reserved prefix and the inlined column rename migration were added in 1.1 and are not exercised when ducklake_default_version is pinned to 1.0",
+      "paths": [
+        "test/sql/data_inlining/inlining_reserved_column_names.test",
+        "test/sql/alter/issue_944.test",
+        "test/sql/migration/inlined_column_rename.test",
+        "test/sql/migration/inlined_column_rename_conflict.test",
+        "test/sql/migration/inlined_column_rename_partial.test",
+        "test/sql/migration/inlined_column_rename_dev_conflict.test",
+        "test/sql/migration/inlined_column_rename_missing_table.test",
+        "test/sql/migration/inlined_column_rename_remigrate.test",
+        "test/sql/migration/inlined_column_rename_hint.test",
+        "test/sql/migration/inlined_column_rename_reverse_hint.test",
+        "test/sql/migration/inlined_column_rename_stats_hint.test",
+        "test/sql/migration/inlined_column_rename_dev_missing_table.test",
+        "test/sql/migration/dev1_migration.test",
+        "test/sql/migration/stale_version_after_migration.test",
+        "test/sql/settings/create_table_inlining_options.test"
+      ]
+    },
+    {
+      "reason": "Merging files across schema versions requires 1.1 and is disabled when ducklake_default_version is pinned to 1.0",
+      "paths": [
+        "test/sql/compaction/compaction_alter_table.test",
+        "test/sql/compaction/compaction_schema_version_per_table.test",
+        "test/sql/compaction/merge_adjacent_cross_schema.test"
+      ]
+    },
+    {
+      "reason": "Epoch partition transforms were added in 1.1 and are not available when ducklake_default_version is pinned to 1.0",
+      "paths": [
+        "test/sql/add_files/add_file_epoch_partitioned.test",
+        "test/sql/data_inlining/data_inlining_epoch_partitions.test",
+        "test/sql/partitioning/epoch_timestamptz.test",
+        "test/sql/partitioning/epoch_transform_column_types.test",
+        "test/sql/partitioning/epoch_transforms.test",
+        "test/sql/partitioning/update_partition_epoch.test"
+      ]
+    },
+    {
+      "reason": "Deletion vectors of several snapshots in one puffin file were added in 1.1, a catalog pinned to 1.0 writes such deletes to parquet delete files",
+      "paths": [
+        "test/sql/delete/delete_mixed_formats.test",
+        "test/sql/delete/deletion_vector.test",
+        "test/sql/delete/deletion_vector_inlined_flush.test",
+        "test/sql/delete/deletion_vector_multi_snapshot.test",
+        "test/sql/delete/deletion_vector_replaced_twice.test",
+        "test/sql/rewrite_data_files/rewrite_deletion_vectors.test"
+      ]
+    },
+    {
+      "reason": "Requests to the REST API that inspect what DuckLake 1.0 does not have: nested schemas, exact string statistics, row group counts, prefixed inlined columns or snapshot tags",
+      "paths": [
+        "test/sql/rest/rest_aggregates.test",
+        "test/sql/rest/rest_api_requests.test",
+        "test/sql/rest/rest_ddl.test",
+        "test/sql/rest/rest_entry_ids.test",
+        "test/sql/rest/rest_file_counts.test",
+        "test/sql/rest/rest_snapshot_tags.test",
+        "test/sql/rest/rest_struct_projection.test"
+      ]
+    },
+    {
+      "reason": "Queries the 2.0 visibility tables, which a 1.0 catalog does not have",
+      "paths": [
+        "test/sql/add_files/add_files_after_reset_partitioned_by.test",
+        "test/sql/benchmark/flush_inlined_data.test",
+        "test/sql/benchmark/merge_adjacent_partitioned.test",
+        "test/sql/checkpoint/checkpoint_ducklake.test",
+        "test/sql/compaction/compaction_transient_partition_spec.test",
+        "test/sql/compaction/expire_snapshots_file_ranges.test",
+        "test/sql/compaction/merge_adjacent_external_hive_paths.test",
+        "test/sql/compaction/merge_adjacent_file_size_filter.test",
+        "test/sql/compaction/merge_adjacent_newer_than.test",
+        "test/sql/compaction/merge_adjacent_partial_file_info.test",
+        "test/sql/compaction/merge_adjacent_partial_max.test",
+        "test/sql/compaction/merge_adjacent_rotation_mode.test",
+        "test/sql/compaction/merge_rewrite_partial_file_info.test",
+        "test/sql/compaction/merge_rewrite_same_transaction_stats.test",
+        "test/sql/compaction/repro_merge_adjacent_zero_output.test",
+        "test/sql/compaction/rewrite_deletes_full_file_delete_after_flush.test",
+        "test/sql/compaction/rewrite_narrow_older_transaction.test",
+        "test/sql/compaction/rewrite_record_count.test",
+        "test/sql/delete/multi_deletes.test",
+        "test/sql/deletion_inlining/test_deletion_from_file_and_inserted_inlining.test",
+        "test/sql/deletion_inlining/test_deletion_from_file_and_inserted_inlining_non_sequential.test",
+        "test/sql/deletion_inlining/test_deletion_from_inlined_insertion.test",
+        "test/sql/deletion_inlining/test_deletion_from_inlined_multiple_snapshots.test",
+        "test/sql/deletion_inlining/test_deletion_inlining.test",
+        "test/sql/deletion_inlining/test_deletion_inlining_compaction.test",
+        "test/sql/deletion_inlining/test_deletion_inlining_stats.test",
+        "test/sql/deletion_inlining/test_deletion_multiple_tables.test",
+        "test/sql/deletion_inlining/test_multiple_files_flush.test_slow",
+        "test/sql/issues/issue_1573_rewritten_delete_snapshot.test",
+        "test/sql/metadata/file_visibility_layout.test",
+        "test/sql/partitioning/bucket_pruning.test",
+        "test/sql/partitioning/long_partition_value_path.test",
+        "test/sql/partitioning/partition_nop.test",
+        "test/sql/partitioning/reset_partitioning_insert_transaction.test",
+        "test/sql/partitioning/reset_set_back_same_spec.test",
+        "test/sql/quack/noop_partition_alter_data_files.test",
+        "test/sql/rewrite_data_files/test_rewrite_concurrency.test",
+        "test/sql/rewrite_data_files/test_rewrite_db.test",
+        "test/sql/rewrite_data_files/test_rewrite_inlined_deletes_flush.test",
+        "test/sql/remove_orphans/puffin_orphan.test",
+        "test/sql/delete/delete_file_events_main.test",
+        "test/sql/delete/delete_replacement_commit_statements.test",
+        "test/sql/retry/retry_conflict_read_shapes.test",
+        "test/sql/rewrite_data_files/test_rewrite_inlined_file_deletes.test",
+        "test/sql/rewrite_data_files/test_rewrite_inlined_file_deletes_add_files.test",
+        "test/sql/rewrite_data_files/test_rewrite_many_non_candidate_files.test",
+        "test/sql/rewrite_data_files/test_rewrite_partitioning.test",
+        "test/sql/rewrite_data_files/test_rewrite_target_file_size.test",
+        "test/sql/rewrite_data_files/test_rewrite_target_file_size_rotation.test",
+        "test/sql/sorted_table/merge_adjacent_sorted_basic.test",
+        "test/sql/sorted_table/merge_adjacent_sorted_transaction_alter_table_unrelated.test",
+        "test/sql/sorted_table/merge_adjacent_sorted_transaction_renamed.test",
+        "test/sql/stats/skip_stats_columns.test",
+        "test/sql/stats/table_stats_null_totals.test",
+        "test/sql/stats/table_stats_null_totals_retry.test",
+        "test/sql/catalog/catalog_row_companions.test",
+        "test/sql/compaction/expire_snapshots_catalog_rows.test",
+        "test/sql/catalog/catalog_entity_row_companions.test",
+        "test/sql/compaction/expire_snapshots_entity_rows.test",
+        "test/sql/catalog/catalog_tag_row_companions.test",
+        "test/sql/compaction/expire_snapshots_tag_rows.test",
+        "test/sql/alter/create_table_drop_column_same_transaction.test"
+      ]
+    }
+  ]
+}

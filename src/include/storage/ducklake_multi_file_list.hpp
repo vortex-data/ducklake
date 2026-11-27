@@ -30,45 +30,90 @@ public:
 	DuckLakeMultiFileList(DuckLakeFunctionInfo &read_info, vector<DuckLakeFileListEntry> files_to_scan);
 	DuckLakeMultiFileList(DuckLakeFunctionInfo &read_info, const DuckLakeInlinedTableInfo &inlined_table);
 
-	unique_ptr<MultiFileList> DynamicFilterPushdown(ClientContext &context, const MultiFileOptions &options,
-	                                                const vector<string> &names, const vector<LogicalType> &types,
-	                                                const vector<column_t> &column_ids,
-	                                                TableFilterSet &filters) const override;
+	unique_ptr<MultiFileList> DynamicFilterPushdown(MultiFileDynamicPushdownInfo &pushdown_info) const override;
 
 	unique_ptr<MultiFileList> ComplexFilterPushdown(ClientContext &context, const MultiFileOptions &options,
 	                                                MultiFilePushdownInfo &info,
 	                                                vector<unique_ptr<Expression>> &filters) const override;
 
-	vector<OpenFileInfo> GetAllFiles() const override;
 	FileExpandResult GetExpandResult() const override;
 	idx_t GetTotalFileCount() const override;
 	unique_ptr<NodeStatistics> GetCardinality(ClientContext &context) const override;
 	DuckLakeTableEntry &GetTable();
 	unique_ptr<MultiFileList> Copy() const override;
-	bool HasTransactionLocalData() const {
-		return !transaction_local_files.empty() || transaction_local_data;
-	}
 	vector<DuckLakeFileListExtendedEntry> GetFilesExtended() const;
 	const vector<DuckLakeFileListEntry> &GetFiles() const;
+	//! Sets the columns that the scan reads (field ids of top-level columns), before the file list is read: metadata
+	//! managers that return the inlined rows with the file list only have to return these columns
+	void SetProjection(vector<DuckLakeProjectedColumn> columns) const;
 	const DuckLakeFileListEntry &GetFileEntry(idx_t file_idx) const;
+	//! Set the columns a scan reads, before its file list is read
+	void SetScanColumns(const vector<MultiFileColumnDefinition> &global_columns,
+	                    const vector<ColumnIndex> &column_ids) const;
 	optional_ptr<const FilterPushdownInfo> GetFilterInfo() const {
 		return filter_info.get();
 	}
 
+	bool CanUseGlobalStats() const;
+	//! Whether filters can prune files by their stats
+	bool SupportsFilterPushdown() const;
 	bool IsDeleteScan() const;
 	const DuckLakeDeleteScanEntry &GetDeleteScanEntry(idx_t file_idx);
+	static DuckLakeFileData GetDeleteData(const DuckLakeDataFile &file);
+	static DuckLakeFileData GetDeleteData(const DuckLakeDeleteFile &delete_file);
 
 protected:
 	//! Get the i-th expanded file
 	OpenFileInfo GetFile(idx_t i) const override;
 
 private:
+	void ApplyLocalChanges(DuckLakeTransaction &transaction) const;
 	void GetFilesForTable() const;
+	//! Read the committed files, and the committed inlined rows before them when each metadata query commits
+	vector<DuckLakeFileListEntry>
+	ReadCommittedFiles(DuckLakeTransaction &transaction,
+	                   identifier_map_t<shared_ptr<DuckLakeCommittedInlinedRows>> &inlined_rows) const;
 	void GetTableInsertions() const;
 	void GetTableDeletions() const;
-	//! Get the row_id_start for transaction-local inlined data.
-	idx_t GetTransactionLocalRowIdStart(idx_t transaction_row_start) const;
-	void AddFilterToPushdownInfo(FilterPushdownInfo &pushdown_info, column_t column_id, unique_ptr<TableFilter> filter) const;
+	void AddInlinedDataTables(DuckLakeTransaction &transaction) const;
+	void AddFilterToPushdownInfo(FilterPushdownInfo &pushdown_info, column_t column_id,
+	                             unique_ptr<TableFilter> filter) const;
+	//! Build the node for a table filter on one column - a leaf, or a conjunction of them when it
+	//! constrains several nested fields. nullptr for virtual columns and subjects that have no stats.
+	unique_ptr<DuckLakeFilterNode> GetFilterNode(column_t column_id, unique_ptr<TableFilter> filter) const;
+	//! Build the node for a filter expression reading one table column, possibly several of its fields
+	unique_ptr<DuckLakeFilterNode> GetColumnFilterNode(column_t column_id, const Expression &expr,
+	                                                   const LogicalType &column_type) const;
+	//! Record the leaves of a node as single-column filters
+	void AddFilterNodeToPushdownInfo(FilterPushdownInfo &pushdown_info, DuckLakeFilterNode &node) const;
+	//! Build a leaf node directly from an expression that constrains a single column
+	unique_ptr<DuckLakeFilterNode> GetExpressionFilterNode(MultiFilePushdownInfo &info, const Expression &expr) const;
+	//! Resolve the field a filter subject reads, descending into nested fields
+	optional_ptr<const DuckLakeFieldId> ResolveFilterField(const Expression &subject, column_t column_id) const;
+	//! Reduce an expression to per-column filters using the FilterCombiner
+	unique_ptr<DuckLakeFilterNode> CombineFilterNode(ClientContext &context, MultiFilePushdownInfo &info,
+	                                                 const Expression &expr) const;
+	//! Budgets for building one filter tree
+	struct FilterTreeState {
+		//! Bounds how much of the expression we walk - every step runs a FilterCombiner over it
+		static constexpr idx_t MAX_VISITED_NODES = 64;
+		//! Bounds what the generated query costs: one stats condition per leaf, all nested in one OR/AND
+		//! chain. Separate from the walk, since one visit can yield a leaf per column. The leaves share
+		//! the column's stats join, but planning the chain still grows superlinearly in its size.
+		static constexpr idx_t MAX_LEAVES = 64;
+
+		idx_t visited_nodes = 0;
+		idx_t leaves = 0;
+		//! Set when a budget runs out - the tree is then dropped rather than kept half-built
+		bool exhausted = false;
+
+		bool VisitNode();
+		bool AddLeaves(const DuckLakeFilterNode &node);
+	};
+	//! Build a filter tree, or nullptr if nothing in the expression can be evaluated against column stats.
+	//! A tree is not a promise that it prunes - that is decided when the SQL is generated.
+	unique_ptr<DuckLakeFilterNode> BuildFilterTree(ClientContext &context, MultiFilePushdownInfo &info,
+	                                               const Expression &expr, FilterTreeState &state) const;
 
 private:
 	mutable mutex file_lock;
@@ -82,6 +127,11 @@ private:
 	shared_ptr<DuckLakeInlinedData> transaction_local_data;
 	//! Inlined data tables
 	mutable vector<DuckLakeInlinedTableInfo> inlined_data_tables;
+	//! The field ids a scan reads, set before its file list is read, with the snapshot id column under its own id
+	mutable unique_ptr<unordered_set<int32_t>> scan_field_ids;
+	//! The columns that the scan reads, if known when the file list is read
+	mutable bool has_projection = false;
+	mutable vector<DuckLakeProjectedColumn> projection;
 	//! The set of delete scans, only used when scanning deleted tuples using ducklake_table_deletions
 	mutable vector<DuckLakeDeleteScanEntry> delete_scans;
 	//! Filter pushdown information
