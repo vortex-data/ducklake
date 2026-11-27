@@ -6151,11 +6151,11 @@ string DuckLakeMetadataManager::WriteNewDataFilesSqlBatch(const vector<DuckLakeF
 			visibility_values.push_back(AddEventTuple(table_id, data_file_index, begin_snapshot));
 			range_columns = string();
 		}
-		auto data_file_value = StringUtil::Format(
-		    "(%d, %d%s, NULL, %s, %s, %s, %d, %d, %s, %s, %s, %s, %s, %s", data_file_index, table_id, range_columns,
-		    SQLString(path.path), DuckLakeUtil::BoolLiteral(path.path_is_relative), SQLString(file.file_format),
-		    file.row_count, file.file_size_bytes, footer_size, row_id, partition_id, encryption_key, mapping,
-		    partial_max);
+		auto data_file_value =
+		    StringUtil::Format("(%d, %d%s, NULL, %s, %s, %s, %d, %d, %s, %s, %s, %s, %s, %s", data_file_index, table_id,
+		                       range_columns, SQLString(path.path), DuckLakeUtil::BoolLiteral(path.path_is_relative),
+		                       SQLString(file.file_format), file.row_count, file.file_size_bytes, footer_size, row_id,
+		                       partition_id, encryption_key, mapping, partial_max);
 		if (supports_v1_1_metadata) {
 			data_file_value += ", " + DuckLakeUtil::OptionalIdxOrNull(file.row_group_count);
 		}

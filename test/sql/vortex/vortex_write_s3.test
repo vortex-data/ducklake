@@ -1,7 +1,8 @@
 # name: test/sql/vortex/vortex_write_s3.test
-# description: INSERT into a vortex-format DuckLake table on S3 and read it back. Regression for the
-#              double-slash data-file path that rolled back commits on S3.
+# description: INSERT into a vortex-format DuckLake table on S3 and read it back
 # group: [vortex]
+
+# Regression for the double-slash data-file path that rolled back commits on S3.
 
 require ducklake
 

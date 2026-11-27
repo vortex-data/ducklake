@@ -1,6 +1,7 @@
 # name: test/sql/vortex/vortex_read_dispatch.test
 # description: DuckLake scans data files tagged file_format='vortex' via read_vortex (per-file dispatch)
 # group: [vortex]
+
 #
 # Writes a real .vortex file with the vortex extension's own COPY, registers it into DuckLake by
 # tagging the data file's file_format='vortex', and verifies DuckLake reads it back through the

@@ -61,10 +61,10 @@ private:
 	unique_ptr<GlobalTableFunctionState> global_state;
 	unique_ptr<LocalTableFunctionState> local_state;
 
-	vector<column_t> scan_column_ids;              //! columns projected out of the file
-	DataChunk scan_chunk;                          //! raw columns read from the file
-	vector<FormatReaderColumn> output_kinds;       //! how each output column is produced
-	vector<idx_t> output_source_index;             //! for FILE_COLUMN: position in scan_chunk
+	vector<column_t> scan_column_ids;        //! columns projected out of the file
+	DataChunk scan_chunk;                    //! raw columns read from the file
+	vector<FormatReaderColumn> output_kinds; //! how each output column is produced
+	vector<idx_t> output_source_index;       //! for FILE_COLUMN: position in scan_chunk
 	//! Expression executors for expression_map entries, keyed by column_t (from column_ids)
 	unordered_map<column_t, unique_ptr<ExpressionExecutor>> expression_executors;
 };
