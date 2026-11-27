@@ -64,6 +64,8 @@ struct DuckLakeDeleteFile {
 
 struct DuckLakeDataFile {
 	string file_name;
+	//! physical format ("parquet", "vortex", ...); recorded in ducklake_data_file.file_format
+	string file_format = "parquet";
 	idx_t row_count;
 	idx_t file_size_bytes;
 	optional_idx footer_size;

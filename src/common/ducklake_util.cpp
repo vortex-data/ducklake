@@ -24,6 +24,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/common/type_visitor.hpp"
 #include "storage/ducklake_catalog.hpp"
+#include "storage/ducklake_insert.hpp"
 #include "storage/ducklake_scan.hpp"
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
@@ -765,6 +766,11 @@ static string ParseSkippedStatsColumns(ClientContext &, const string &, const Va
 	return string();
 }
 
+static string ParseDataFileFormat(ClientContext &, const string &, const Value &val) {
+	// Physical format new data files are written in: 'parquet' (default) or 'vortex'.
+	return DuckLakeInsert::ValidateDataFileFormat(val.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>());
+}
+
 static const unordered_map<string, config_option_parser_t> &ConfigOptionParsers() {
 	static const unordered_map<string, config_option_parser_t> parsers {
 	    {"parquet_compression", ParseParquetCompression},
@@ -784,6 +790,7 @@ static const unordered_map<string, config_option_parser_t> &ConfigOptionParsers(
 	    {"write_deletion_vectors", ParseBoolean},
 	    {"sort_on_insert", ParseBoolean},
 	    {"skip_stats_columns", ParseSkippedStatsColumns},
+	    {"data_file_format", ParseDataFileFormat},
 	};
 	return parsers;
 }

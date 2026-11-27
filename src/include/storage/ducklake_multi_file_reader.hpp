@@ -111,6 +111,8 @@ public:
 
 private:
 	shared_ptr<BaseFileReader> TryCreateInlinedDataReader(const OpenFileInfo &file);
+	//! Create a non-parquet format reader based on the file's file_format extended option (else nullptr).
+	shared_ptr<BaseFileReader> TryCreateFormatReader(ClientContext &context, const OpenFileInfo &file);
 	//! Gather per-row snapshot_id values using the file positions of the scanned rows
 	void GatherDeletionScanSnapshots(BaseFileReader &reader, const Vector &file_row_numbers, Vector &snapshot_vector,
 	                                 idx_t count) const;

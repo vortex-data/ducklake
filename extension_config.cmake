@@ -13,6 +13,14 @@ if(NOT DEFINED ENV{DISABLE_EXTENSIONS_FOR_TEST})
     duckdb_extension_statically_link(icu json tpch)
 endif()
 
+# Vortex format support (./vortex submodule). Opt-in: needs a Rust toolchain, so it is off in the
+# standard distribution CI. Enable with ENABLE_VORTEX=1.
+if(DEFINED ENV{ENABLE_VORTEX})
+    duckdb_extension_load(vortex
+            SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/vortex
+    )
+endif()
+
 # Linked only when built via CORE_EXTENSIONS
 duckdb_extension_statically_link(httpfs aws)
 

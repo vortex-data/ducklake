@@ -2451,7 +2451,6 @@ static void TransformGlobalStatsRow(const QueryResultRow &row, vector<DuckLakeGl
 		// table-level stats (record_count/next_row_id) without adding a column-stats entry.
 		return;
 	}
-
 	DuckLakeGlobalColumnStatsInfo column_stats;
 	column_stats.column_id = FieldIndex(row.GetValue<uint64_t>(1 + from_column));
 
@@ -2587,11 +2586,9 @@ string DuckLakeMetadataManager::GetFileSelectList(const string &prefix) {
 		count -= 1;
 	}
 
-	auto result = StringUtil::Join(column_list, count, ", ", [&prefix](const string &column) {
+	return StringUtil::Join(column_list, count, ", ", [&prefix](const string &column) {
 		return prefix + "." + column + " AS " + prefix + "_" + column;
 	});
-
-	return result;
 }
 
 //! The row count and the row group count of a file, the row group count only exists in the metadata of DuckLake 1.1
@@ -2606,10 +2603,10 @@ string DuckLakeMetadataManager::GetFileCountsSelectList(const string &prefix, co
 }
 
 string DuckLakeMetadataManager::GetDataFileSelectList(const string &prefix) {
-	// the format DuckLake writes is returned as NULL, so the common case transfers no string
+	// the default parquet format is returned as NULL, so the common case transfers no string
 	return GetFileSelectList(prefix) +
 	       StringUtil::Format(", CASE WHEN %s.file_format = 'parquet' THEN NULL ELSE %s.file_format END AS "
-	                          "%s_unsupported_format",
+	                          "%s_file_format",
 	                          prefix, prefix, prefix) +
 	       GetFileCountsSelectList(prefix, "record_count");
 }
@@ -2617,6 +2614,14 @@ string DuckLakeMetadataManager::GetDataFileSelectList(const string &prefix) {
 string DuckLakeMetadataManager::GetDeleteFileSelectList(const string &prefix) {
 	return GetFileSelectList(prefix) + ", " + prefix + ".format AS " + prefix + "_format" +
 	       GetFileCountsSelectList(prefix, "delete_count");
+}
+
+void DuckLakeMetadataManager::VerifyDataFileFormat(const string &file_format) {
+	if (StringUtil::CIEquals(file_format, "parquet") || StringUtil::CIEquals(file_format, "vortex") ||
+	    StringUtil::CIEquals(file_format, "json")) {
+		return;
+	}
+	throw NotImplementedException("Unsupported data file format: %s", file_format);
 }
 
 DuckLakeFileData DuckLakeMetadataManager::ReadFile(DuckLakeTableEntry &table, const QueryResultRow &row, idx_t &col_idx,
@@ -2657,9 +2662,8 @@ DuckLakeFileData DuckLakeMetadataManager::ReadDataFile(DuckLakeTableEntry &table
 	auto data = ReadFile(table, row, col_idx, is_encrypted);
 	if (!row.IsNull(col_idx)) {
 		auto file_format = row.GetValue<string>(col_idx);
-		if (!StringUtil::CIEquals(file_format, "parquet")) {
-			throw NotImplementedException("Unsupported data file format: %s", file_format);
-		}
+		VerifyDataFileFormat(file_format);
+		data.data_file_format = StringUtil::Lower(file_format);
 	}
 	col_idx++;
 	ReadFileCounts(row, col_idx, data);
@@ -5997,7 +6001,7 @@ string DuckLakeMetadataManager::WriteNewDataFilesWithAppender(DuckLakeSnapshot &
 		data_file_appender.Append(Value());                                             // file_order (NULL)
 		data_file_appender.Append<string_t>(string_t(path.path));                       // path
 		data_file_appender.Append<bool>(path.path_is_relative);                         // path_is_relative
-		data_file_appender.Append<string_t>(string_t("parquet"));                       // file_format
+		data_file_appender.Append<string_t>(string_t(file.file_format));                // file_format
 		data_file_appender.Append<int64_t>(static_cast<int64_t>(file.row_count));       // record_count
 		data_file_appender.Append<int64_t>(static_cast<int64_t>(file.file_size_bytes)); // file_size_bytes
 		AppendBigintOrNull(data_file_appender, file.footer_size);
@@ -6148,9 +6152,10 @@ string DuckLakeMetadataManager::WriteNewDataFilesSqlBatch(const vector<DuckLakeF
 			range_columns = string();
 		}
 		auto data_file_value = StringUtil::Format(
-		    "(%d, %d%s, NULL, %s, %s, 'parquet', %d, %d, %s, %s, %s, %s, %s, %s", data_file_index, table_id,
-		    range_columns, SQLString(path.path), DuckLakeUtil::BoolLiteral(path.path_is_relative), file.row_count,
-		    file.file_size_bytes, footer_size, row_id, partition_id, encryption_key, mapping, partial_max);
+		    "(%d, %d%s, NULL, %s, %s, %s, %d, %d, %s, %s, %s, %s, %s, %s", data_file_index, table_id, range_columns,
+		    SQLString(path.path), DuckLakeUtil::BoolLiteral(path.path_is_relative), SQLString(file.file_format),
+		    file.row_count, file.file_size_bytes, footer_size, row_id, partition_id, encryption_key, mapping,
+		    partial_max);
 		if (supports_v1_1_metadata) {
 			data_file_value += ", " + DuckLakeUtil::OptionalIdxOrNull(file.row_group_count);
 		}
