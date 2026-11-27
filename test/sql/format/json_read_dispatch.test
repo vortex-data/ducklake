@@ -1,6 +1,7 @@
 # name: test/sql/format/json_read_dispatch.test
 # description: DuckLake scan dispatches to read_<format> for non-parquet data files (json), by file_format
 # group: [format]
+
 #
 # DuckLake can only *write* formats whose COPY implements copy_to_bind (parquet, vortex). To verify the
 # read-side per-file dispatch independently of the writer, we register a json file by repointing a data

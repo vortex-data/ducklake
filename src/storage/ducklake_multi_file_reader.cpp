@@ -542,7 +542,7 @@ shared_ptr<BaseFileReader> DuckLakeMultiFileReader::TryCreateInlinedDataReader(c
 }
 
 shared_ptr<BaseFileReader> DuckLakeMultiFileReader::TryCreateFormatReader(ClientContext &context,
-                                                                         const OpenFileInfo &file) {
+                                                                          const OpenFileInfo &file) {
 	if (!file.extended_info) {
 		return nullptr;
 	}

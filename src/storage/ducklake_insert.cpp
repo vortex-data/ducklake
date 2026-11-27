@@ -641,7 +641,8 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 		info->is_from = false;
 	} else {
 		// generate the field ids to be written by the parquet writer
-		info = GetParquetCopyInfo(copy_input.data_path, WrittenFieldIds(*copy_input.field_data, copy_input.virtual_columns),
+		info = GetParquetCopyInfo(copy_input.data_path,
+		                          WrittenFieldIds(*copy_input.field_data, copy_input.virtual_columns),
 		                          copy_input.encryption_key);
 		static const pair<const char *, const char *> PARQUET_OPTIONS[] = {
 		    {"parquet_compression", "compression"},
@@ -649,7 +650,8 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 		    {"parquet_compression_level", "compression_level"}};
 		for (auto &option : PARQUET_OPTIONS) {
 			string option_value;
-			if (catalog.TryGetConfigOption(option.first, option_value, schema_id, table_id, &copy_input.table_options)) {
+			if (catalog.TryGetConfigOption(option.first, option_value, schema_id, table_id,
+			                               &copy_input.table_options)) {
 				info->options[option.second].emplace_back(option_value);
 			}
 		}

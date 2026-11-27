@@ -1,6 +1,7 @@
 # name: test/sql/vortex/vortex_name_map.test
 # description: the format reader resolves renamed columns via the file's mapping_id (name map)
 # group: [vortex]
+
 #
 # After a column rename, a non-parquet file keeps its original physical column names. DuckLake records
 # a name map (mapping_id) mapping the new field ids to those physical names. The format reader must look
