@@ -148,8 +148,8 @@ public:
 	static PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
 	                                    DuckLakeTableEntry &table, string encryption_key);
 	static void RemoveEmptyFiles(ClientContext &context, DuckLakeInsertGlobalState &gstate);
-	static void AddWrittenFiles(ClientContext &context, DuckLakeInsertGlobalState &gstate, DataChunk &chunk,
-	                            const string &encryption_key, optional_idx partition_id, bool set_snapshot_id = false);
+	static void AddWrittenFiles(DuckLakeInsertGlobalState &gstate, DataChunk &chunk, const string &encryption_key,
+	                            optional_idx partition_id, bool set_snapshot_id = false);
 
 	static const DuckLakeFieldId &GetTopLevelColumn(DuckLakeCopyInput &copy_input, FieldIndex field_id,
 	                                                optional_idx &index);
@@ -198,14 +198,9 @@ struct DuckLakeCopyInput {
 	TableIndex table_id;
 	InsertVirtualColumns virtual_columns = InsertVirtualColumns::NONE;
 	optional_idx get_table_index;
-	//! Whether the target table has any NOT NULL columns (enforced via written null-count stats)
-	bool has_not_null_columns = false;
-	//! Whether this write is a flush of inlined data (recovers begin_snapshot / row_id_start from the
-	//! written file's snapshot_id / row_id column statistics). Compaction shares the same virtual columns
-	//! but does not need those stats, so it is distinguished by this flag rather than by virtual_columns.
+	//! Whether this write is a flush of inlined data
 	bool is_flush = false;
-	//! Whether this write is a compaction (merge_adjacent_files). Its directory+rotation output model
-	//! does not compose with the single-file path used for non-parquet formats yet.
+	//! Whether this write is a compaction
 	bool is_compaction = false;
 	//! Whether the rows reach the copy in the order they must be written in
 	bool ordered_input = false;
