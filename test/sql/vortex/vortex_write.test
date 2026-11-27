@@ -27,12 +27,12 @@ INSERT INTO ducklake.t VALUES (1, 'a', 1.5, [1, 2]), (2, 'bb', NULL, []), (3, 'c
 statement ok
 INSERT INTO ducklake.t VALUES (4, 'd', 4.5, [4])
 
-# both writes recorded as vortex, with real row counts and file sizes
-query III
-SELECT file_format, SUM(record_count), bool_and(file_size_bytes > 0)
+# both writes recorded as vortex, with real row counts, file sizes, NULL footer_size, and mapping_id
+query IIIII
+SELECT file_format, SUM(record_count), bool_and(file_size_bytes > 0), bool_and(footer_size IS NULL), bool_and(mapping_id IS NOT NULL)
 FROM ducklake_meta.ducklake_data_file GROUP BY file_format
 ----
-vortex	4	true
+vortex	4	true	true	true
 
 # the data files really are .vortex files
 query I
@@ -112,14 +112,34 @@ SELECT r FROM ducklake.ctas WHERE r = 500
 # carry the metadata these need) rather than crashing or silently corrupting.
 # ---------------------------------------------------------------------------
 
-# NOT NULL columns (enforced via written null-count stats, which vortex lacks)
+# ALTER TABLE RENAME COLUMN works automatically without manual catalog edits (write-time mapping_id)
+statement ok
+ALTER TABLE ducklake.t RENAME COLUMN s TO s_renamed
+
+query IT
+SELECT i, s_renamed FROM ducklake.t ORDER BY i
+----
+1	updated
+3	ccc
+4	d
+
+# NOT NULL columns are enforced via native written null-count statistics
 statement ok
 CREATE TABLE ducklake.nn(i INTEGER NOT NULL)
 
+statement ok
+INSERT INTO ducklake.nn VALUES (1), (2)
+
 statement error
-INSERT INTO ducklake.nn VALUES (1)
+INSERT INTO ducklake.nn VALUES (NULL)
 ----
-NOT NULL columns are not yet supported
+NOT NULL constraint failed
+
+query I
+SELECT i FROM ducklake.nn ORDER BY i
+----
+1
+2
 
 # partitioned writes (need one file per partition value + recorded partition_values)
 statement ok

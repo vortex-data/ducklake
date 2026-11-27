@@ -163,41 +163,8 @@ static bool IsLeafColumnStats(const vector<Value> &col_stats) {
 	return false;
 }
 
-void DuckLakeInsert::AddWrittenFiles(ClientContext &context, DuckLakeInsertGlobalState &global_state, DataChunk &chunk,
+void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, DataChunk &chunk,
                                      const string &encryption_key, optional_idx partition_id, bool set_snapshot_id) {
-	if (global_state.file_format != "parquet") {
-		// non-parquet writers return CHANGED_ROWS_AND_FILE_LIST: {count, files[]}. There are no per-file
-		// stats, so derive the size from the filesystem and map the whole row count to the single file.
-		// (Combinations that need per-file stats - partitioning, flush, NOT NULL - are rejected in
-		// GetCopyOptions before anything is written.)
-		auto &fs = FileSystem::GetFileSystem(context);
-		for (idx_t r = 0; r < chunk.size(); r++) {
-			auto files_value = chunk.GetValue(1, r);
-			if (files_value.IsNull()) {
-				continue;
-			}
-			auto &file_list = ListValue::GetChildren(files_value);
-			if (file_list.empty()) {
-				continue;
-			}
-			if (file_list.size() != 1) {
-				throw NotImplementedException("Writing '%s' data files is only supported as a single file per write",
-				                              global_state.file_format);
-			}
-			DuckLakeDataFile data_file;
-			data_file.file_name = file_list[0].GetValue<string>();
-			data_file.file_format = global_state.file_format;
-			data_file.row_count = chunk.GetValue(0, r).GetValue<idx_t>();
-			auto handle = fs.OpenFile(data_file.file_name, FileFlags::FILE_FLAGS_READ);
-			data_file.file_size_bytes = NumericCast<idx_t>(fs.GetFileSize(*handle));
-			data_file.encryption_key = encryption_key;
-			if (partition_id.IsValid()) {
-				data_file.partition_id = partition_id.GetIndex();
-			}
-			global_state.written_files.push_back(std::move(data_file));
-		}
-		return;
-	}
 	auto skipped_fields = global_state.table.GetSkippedStatsFields();
 	auto &field_data = global_state.table.GetFieldData();
 	auto snapshot_id_name = InternalColumnName(field_data, "_ducklake_internal_snapshot_id");
@@ -208,7 +175,13 @@ void DuckLakeInsert::AddWrittenFiles(ClientContext &context, DuckLakeInsertGloba
 		data_file.file_format = global_state.file_format;
 		data_file.row_count = chunk.GetValue(1, r).GetValue<idx_t>();
 		data_file.file_size_bytes = chunk.GetValue(2, r).GetValue<idx_t>();
-		data_file.footer_size = chunk.GetValue(3, r).GetValue<idx_t>();
+		auto footer_size_val = chunk.GetValue(3, r);
+		if (!footer_size_val.IsNull()) {
+			auto footer_size = footer_size_val.GetValue<idx_t>();
+			if (global_state.file_format == "parquet" || footer_size > 0) {
+				data_file.footer_size = footer_size;
+			}
+		}
 		if (chunk.ColumnCount() > 6) {
 			auto extra_info = chunk.GetValue(6, r);
 			if (!extra_info.IsNull()) {
@@ -333,7 +306,7 @@ void DuckLakeInsert::AddWrittenFiles(ClientContext &context, DuckLakeInsertGloba
 
 SinkResultType DuckLakeInsert::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &global_state = input.global_state.Cast<DuckLakeInsertGlobalState>();
-	AddWrittenFiles(context.client, global_state, chunk, encryption_key, partition_id);
+	AddWrittenFiles(global_state, chunk, encryption_key, partition_id);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -360,6 +333,16 @@ void DuckLakeInsert::RemoveEmptyFiles(ClientContext &context, DuckLakeInsertGlob
 	gstate.empty_files.clear();
 }
 
+static unique_ptr<DuckLakeNameMapEntry> BuildNameMapEntry(const DuckLakeFieldId &field_id) {
+	auto entry = make_uniq<DuckLakeNameMapEntry>();
+	entry->source_name = field_id.Name().GetIdentifierName();
+	entry->target_field_id = field_id.GetFieldIndex();
+	for (auto &child : field_id.Children()) {
+		entry->child_entries.push_back(BuildNameMapEntry(*child));
+	}
+	return entry;
+}
+
 SinkFinalizeType DuckLakeInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                           OperatorSinkFinalizeInput &input) const {
 	auto &global_state = input.global_state.Cast<DuckLakeInsertGlobalState>();
@@ -369,6 +352,18 @@ SinkFinalizeType DuckLakeInsert::Finalize(Pipeline &pipeline, Event &event, Clie
 		global_state.total_insert_count += data_file.row_count;
 	}
 	auto &transaction = DuckLakeTransaction::Get(context, global_state.table.catalog);
+	if (global_state.file_format != "parquet" && !global_state.written_files.empty()) {
+		// Record a name map for formats without embedded field ids so column renames/drops stay safe.
+		auto name_map = make_uniq<DuckLakeNameMap>();
+		name_map->table_id = global_state.table.GetTableId();
+		for (auto &field_id : global_state.table.GetFieldData().GetFieldIds()) {
+			name_map->column_maps.push_back(BuildNameMapEntry(*field_id));
+		}
+		auto mapping_id = transaction.AddNameMap(std::move(name_map));
+		for (auto &data_file : global_state.written_files) {
+			data_file.mapping_id = mapping_id;
+		}
+	}
 	transaction.AppendFiles(global_state.table.GetTableId(), std::move(global_state.written_files));
 	if (reads_table) {
 		// a concurrent insert could have produced rows that would have changed what we inserted
@@ -469,7 +464,6 @@ DuckLakeCopyInput::DuckLakeCopyInput(ClientContext &context, DuckLakeTableEntry 
 	table_id = table.GetTableId();
 	table_options = table.GetTableOptions();
 	encryption_key = catalog.GenerateEncryptionKey(context);
-	has_not_null_columns = !table.GetNotNullFields().empty();
 }
 
 DuckLakeCopyInput::DuckLakeCopyInput(ClientContext &context, DuckLakeSchemaEntry &schema, const ColumnList &columns,
@@ -607,28 +601,17 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 
 	unique_ptr<CopyInfo> info;
 	if (!is_parquet) {
-		// non-parquet writes emit a single file with no per-file column statistics. Reject the cases that
-		// rely on those stats here, before anything is written, so no orphan file is left on disk.
+		// Non-parquet writes currently emit a single unpartitioned file; reject unsupported modes upfront.
 		if (GetPartitionId(copy_input.partition_data).IsValid()) {
-			// partition assignment requires one file per partition value + recorded partition_values
 			throw NotImplementedException("Partitioned writes are not yet supported for the '%s' data file format",
 			                              data_file_format);
 		}
 		if (copy_input.is_flush) {
-			// flush of inlined data derives begin_snapshot / row_id_start from the written file's
-			// snapshot_id / row_id column statistics
 			throw NotImplementedException("Flushing inlined data is not yet supported for the '%s' data file format - "
 			                              "set data_inlining_row_limit to 0 for such tables",
 			                              data_file_format);
 		}
-		if (copy_input.has_not_null_columns) {
-			// NOT NULL is enforced by inspecting written null-count statistics
-			throw NotImplementedException("NOT NULL columns are not yet supported for the '%s' data file format",
-			                              data_file_format);
-		}
 		if (copy_input.is_compaction) {
-			// compaction's directory + rotation output does not compose with the single-file path used
-			// for non-parquet writes yet
 			throw NotImplementedException("Compaction is not yet supported for the '%s' data file format",
 			                              data_file_format);
 		}
@@ -679,6 +662,11 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 	if (!copy_fun.function.copy_to_bind) {
 		throw NotImplementedException(
 		    "The '%s' copy function cannot be used to write DuckLake data files (no copy_to_bind support)",
+		    data_file_format);
+	}
+	if (!is_parquet && !copy_fun.function.copy_to_get_written_statistics) {
+		throw NotImplementedException(
+		    "The '%s' copy function cannot be used to write DuckLake data files (no written statistics support)",
 		    data_file_format);
 	}
 
@@ -738,23 +726,15 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 	copy.write_partition_columns = true;
 	copy.hive_file_pattern =
 	    catalog.UseHiveFilePattern(copy_input.encryption_key.empty(), schema_id, table_id, &copy_input.table_options);
-	if (is_parquet) {
-		copy.return_type = CopyFunctionReturnType::WRITTEN_FILE_STATISTICS;
-	} else {
-		// non-parquet COPY functions (vortex) can't report per-file statistics; take the written file
-		// list instead and derive size/row-count ourselves. They also don't implement rotate_next_file,
-		// so we can't use DuckDB's directory+rotation naming - generate a single full file path here
-		// (the plain single-file COPY path) so the writer receives a file, not the table directory.
-		copy.return_type = CopyFunctionReturnType::CHANGED_ROWS_AND_FILE_LIST;
+	copy.return_type = CopyFunctionReturnType::WRITTEN_FILE_STATISTICS;
+	if (!is_parquet) {
+		// Non-parquet writers do not implement rotate_next_file, so write a single file path.
 		copy.rotate = false;
 		copy.per_thread_output = false;
 		copy.partition_output = false;
 		copy.file_size_bytes = optional_idx();
 		auto &transaction = DuckLakeTransaction::Get(context, catalog);
 		auto file_name = "ducklake-" + transaction.GenerateUUID() + "." + data_file_format;
-		// Use DuckLakeUtil::JoinPath (not FileSystem::JoinPath): data_path may already end with a separator
-		// (table data paths are generated with a trailing separator), and FileSystem::JoinPath appends the
-		// separator unconditionally, producing a double slash that S3/minio rejects on the stats read-back.
 		copy.file_path = DuckLakeUtil::JoinPath(fs, copy_input.data_path, file_name);
 		copy.file_extension = "";
 		copy.write_empty_file = false;
