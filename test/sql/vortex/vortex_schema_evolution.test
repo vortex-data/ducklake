@@ -1,0 +1,237 @@
+# name: test/sql/vortex/vortex_schema_evolution.test
+# description: test schema evolution (defaults, drop+add, struct evolution, casts, lists, maps, count(*)) on Vortex files
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_vse.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_vse_files', METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+CALL ducklake.set_option('data_inlining_row_limit', 0)
+
+statement ok
+CALL ducklake.set_option('data_file_format', 'vortex')
+
+# 1. ADD COLUMN with DEFAULT (and NULL default) + filter on default column + COUNT(*)
+statement ok
+CREATE TABLE ducklake.t_add(id INTEGER, val INTEGER)
+
+statement ok
+INSERT INTO ducklake.t_add VALUES (1, 10), (2, 20), (3, 30)
+
+query I
+SELECT COUNT(*) FROM ducklake.t_add
+----
+3
+
+statement ok
+ALTER TABLE ducklake.t_add ADD COLUMN c_int INTEGER DEFAULT 42
+
+statement ok
+ALTER TABLE ducklake.t_add ADD COLUMN c_str VARCHAR DEFAULT 'init'
+
+statement ok
+ALTER TABLE ducklake.t_add ADD COLUMN c_null VARCHAR
+
+statement ok
+CALL ducklake.set_option('data_file_format', 'parquet')
+
+statement ok
+INSERT INTO ducklake.t_add VALUES (4, 40, 99, 'new', 'present')
+
+statement ok
+CALL ducklake.set_option('data_file_format', 'vortex')
+
+statement ok
+INSERT INTO ducklake.t_add VALUES (5, 50, 55, 'vtx', 'yes')
+
+query IIITT
+SELECT id, val, c_int, c_str, c_null FROM ducklake.t_add ORDER BY id
+----
+1	10	42	init	NULL
+2	20	42	init	NULL
+3	30	42	init	NULL
+4	40	99	new	present
+5	50	55	vtx	yes
+
+# Filter against missing-column default evaluates accurately across old/new files
+query II
+SELECT id, c_int FROM ducklake.t_add WHERE c_int = 42 ORDER BY id
+----
+1	42
+2	42
+3	42
+
+query II
+SELECT id, c_int FROM ducklake.t_add WHERE c_int = 55 ORDER BY id
+----
+5	55
+
+query II
+SELECT id, c_int FROM ducklake.t_add WHERE c_int = 99 ORDER BY id
+----
+4	99
+
+query I
+SELECT COUNT(*) FROM ducklake.t_add
+----
+5
+
+# 2. Type widening on Vortex column + filter on widened column
+statement ok
+ALTER TABLE ducklake.t_add ALTER COLUMN val TYPE BIGINT
+
+statement ok
+INSERT INTO ducklake.t_add VALUES (6, 5000000000, 77, 'big', NULL)
+
+query II
+SELECT id, val FROM ducklake.t_add WHERE val > 25 ORDER BY id
+----
+3	30
+4	40
+5	50
+6	5000000000
+
+# 3. DROP COLUMN + ADD COLUMN with same name (with explicit mapping_id on the old Vortex file)
+statement ok
+CREATE TABLE ducklake.t_drop(id INTEGER, secret VARCHAR)
+
+statement ok
+INSERT INTO ducklake.t_drop VALUES (1, 'old_a'), (2, 'old_b')
+
+# Register a mapping_id for the existing Vortex file before dropping/re-adding 'secret'
+statement ok
+INSERT INTO ducklake_meta.ducklake_column_mapping
+SELECT 200, table_id, 'map_by_name' FROM ducklake_meta.ducklake_table WHERE table_name = 't_drop'
+
+statement ok
+INSERT INTO ducklake_meta.ducklake_name_mapping
+SELECT 200, column_id, column_name, column_id, NULL, false
+FROM ducklake_meta.ducklake_column
+WHERE table_id = (SELECT table_id FROM ducklake_meta.ducklake_table WHERE table_name = 't_drop')
+
+statement ok
+UPDATE ducklake_meta.ducklake_data_file
+SET mapping_id = 200
+WHERE table_id = (SELECT table_id FROM ducklake_meta.ducklake_table WHERE table_name = 't_drop')
+
+statement ok
+ALTER TABLE ducklake.t_drop DROP COLUMN secret
+
+statement ok
+ALTER TABLE ducklake.t_drop ADD COLUMN secret VARCHAR DEFAULT 'fresh'
+
+statement ok
+INSERT INTO ducklake.t_drop VALUES (3, 'new_c')
+
+# Re-added 'secret' must return 'fresh' for old rows, NOT the dropped column's values
+query IT
+SELECT id, secret FROM ducklake.t_drop ORDER BY id
+----
+1	fresh
+2	fresh
+3	new_c
+
+# 4. Nested STRUCT evolution (add field with default, drop field, NULL parent struct, pushdown extract)
+statement ok
+CREATE TABLE ducklake.t_struct(id INTEGER, s STRUCT(a INTEGER, b VARCHAR))
+
+statement ok
+INSERT INTO ducklake.t_struct VALUES (1, {'a': 10, 'b': 'x'}), (2, NULL), (3, {'a': 30, 'b': 'z'})
+
+statement ok
+ALTER TABLE ducklake.t_struct ADD COLUMN s.c INTEGER DEFAULT 7
+
+statement ok
+INSERT INTO ducklake.t_struct VALUES (4, {'a': 40, 'b': 'w', 'c': 88})
+
+query II
+SELECT id, s FROM ducklake.t_struct ORDER BY id
+----
+1	{'a': 10, 'b': x, 'c': 7}
+2	NULL
+3	{'a': 30, 'b': z, 'c': 7}
+4	{'a': 40, 'b': w, 'c': 88}
+
+# Pushdown struct field extraction including NULL parent struct and filter
+query III
+SELECT id, s.a, s.c FROM ducklake.t_struct ORDER BY id
+----
+1	10	7
+2	NULL	NULL
+3	30	7
+4	40	88
+
+query II
+SELECT id, s.a FROM ducklake.t_struct WHERE s.a >= 30 ORDER BY id
+----
+3	30
+4	40
+
+statement ok
+ALTER TABLE ducklake.t_struct DROP COLUMN s.b
+
+query II
+SELECT id, s FROM ducklake.t_struct ORDER BY id
+----
+1	{'a': 10, 'c': 7}
+2	NULL
+3	{'a': 30, 'c': 7}
+4	{'a': 40, 'c': 88}
+
+# 5. Nested STRUCT field rename via mapping_id (parent_column)
+statement ok
+CREATE TABLE ducklake.t_struct_ren(id INTEGER, s STRUCT(a INTEGER, b VARCHAR))
+
+statement ok
+INSERT INTO ducklake.t_struct_ren VALUES (1, {'a': 10, 'b': 'x'}), (2, {'a': 20, 'b': 'y'})
+
+statement ok
+INSERT INTO ducklake_meta.ducklake_column_mapping
+SELECT 300, table_id, 'map_by_name' FROM ducklake_meta.ducklake_table WHERE table_name = 't_struct_ren'
+
+statement ok
+INSERT INTO ducklake_meta.ducklake_name_mapping
+SELECT 300, column_id, column_name, column_id, parent_column, false
+FROM ducklake_meta.ducklake_column
+WHERE table_id = (SELECT table_id FROM ducklake_meta.ducklake_table WHERE table_name = 't_struct_ren')
+
+statement ok
+UPDATE ducklake_meta.ducklake_data_file
+SET mapping_id = 300
+WHERE table_id = (SELECT table_id FROM ducklake_meta.ducklake_table WHERE table_name = 't_struct_ren')
+
+statement ok
+ALTER TABLE ducklake.t_struct_ren RENAME COLUMN s.a TO a2
+
+query II
+SELECT id, s FROM ducklake.t_struct_ren ORDER BY id
+----
+1	{'a2': 10, 'b': x}
+2	{'a2': 20, 'b': y}
+
+query II
+SELECT id, s.a2 FROM ducklake.t_struct_ren WHERE s.a2 = 20
+----
+2	20
+
+# 6. LIST and LIST<STRUCT> evolution on Vortex files
+statement ok
+CREATE TABLE ducklake.t_nested(id INTEGER, lst INTEGER[], items STRUCT(k VARCHAR, v INTEGER)[])
+
+statement ok
+INSERT INTO ducklake.t_nested VALUES (1, [1, 2, 3], [{'k': 'a', 'v': 10}, {'k': 'b', 'v': 20}]), (2, [], [])
+
+statement ok
+ALTER TABLE ducklake.t_nested ADD COLUMN items.element.tag VARCHAR DEFAULT 't'
+
+query III
+SELECT id, lst, items FROM ducklake.t_nested ORDER BY id
+----
+1	[1, 2, 3]	[{'k': a, 'v': 10, 'tag': t}, {'k': b, 'v': 20, 'tag': t}]
+2	[]	[]
