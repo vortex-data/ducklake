@@ -50,8 +50,9 @@ statement ok
 CALL ducklake_rewrite_data_files('ducklake', 'partitioned_tbl', delete_threshold => 0)
 
 query II
-SELECT COUNT(*) FILTER (WHERE end_snapshot IS NULL), bool_or(contains(path, 'part_key='))
-FROM ducklake_metadata.ducklake_data_file
+SELECT COUNT(*) FILTER (WHERE v.end_snapshot IS NULL), bool_or(contains(df.path, 'part_key='))
+FROM ducklake_metadata.ducklake_data_file df
+JOIN (SELECT data_file_id, MAX(CASE WHEN is_delete = TRUE THEN snapshot_id END) AS end_snapshot FROM ducklake_metadata.ducklake_file_visibility WHERE branch_id = 0 GROUP BY data_file_id) v USING (data_file_id)
 ----
 2	false
 
@@ -77,7 +78,8 @@ CALL ducklake_merge_adjacent_files('ducklake', 'opt_in_hive_tbl')
 query II
 SELECT COUNT(*), bool_and(contains(df.path, 'part_key='))
 FROM ducklake_metadata.ducklake_data_file df
+JOIN (SELECT data_file_id, MAX(CASE WHEN is_delete = TRUE THEN snapshot_id END) AS end_snapshot FROM ducklake_metadata.ducklake_file_visibility WHERE branch_id = 0 GROUP BY data_file_id) v USING (data_file_id)
 JOIN ducklake_metadata.ducklake_table t USING (table_id)
-WHERE t.table_name = 'opt_in_hive_tbl' AND df.end_snapshot IS NULL
+WHERE t.table_name = 'opt_in_hive_tbl' AND v.end_snapshot IS NULL
 ----
 2	true
