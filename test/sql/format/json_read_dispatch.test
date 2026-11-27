@@ -1,11 +1,11 @@
 # name: test/sql/format/json_read_dispatch.test
-# description: DuckLake scan dispatches to read_<format> for non-parquet data files (json), by file_format
+# description: DuckLake scan dispatches to read_<format> for non-parquet data files (json), covering schema evolution, deletes, filters, nested types, and parallel scans
 # group: [format]
 
 #
 # DuckLake can only *write* formats whose COPY implements copy_to_bind (parquet, vortex). To verify the
-# read-side per-file dispatch independently of the writer, we register a json file by repointing a data
-# file's metadata row at it and tagging file_format='json'.
+# read-side per-file dispatch independently of the writer, we register json files by repointing data
+# file metadata rows at them and tagging file_format='json'.
 
 require ducklake
 
@@ -23,7 +23,7 @@ statement ok
 CREATE TABLE ducklake.t(i INTEGER, s VARCHAR);
 
 statement ok
-INSERT INTO ducklake.t VALUES (1, 'a'), (2, 'bb'), (3, 'ccc');
+INSERT INTO ducklake.t VALUES (1, 'a'), (2, 'bb'), (3, 'ccc'), (4, NULL), (5, 'eeeee');
 
 # sanity: currently a single parquet data file
 query I
@@ -54,6 +54,8 @@ SELECT i, s FROM ducklake.t ORDER BY i
 1	a
 2	bb
 3	ccc
+4	NULL
+5	eeeee
 
 # projection pushdown through the json reader
 query T
@@ -62,20 +64,341 @@ SELECT s FROM ducklake.t ORDER BY i
 a
 bb
 ccc
+NULL
+eeeee
 
-# filter pushdown through the json reader
+# filter pushdown across comparison operators, IS NULL / IS NOT NULL, IN, and post-scan OR / empty-match fallback
 query IT
-SELECT i, s FROM ducklake.t WHERE i >= 2 ORDER BY i
+SELECT i, s FROM ducklake.t WHERE i = 2 ORDER BY i
 ----
 2	bb
+
+query IT
+SELECT i, s FROM ducklake.t WHERE i != 2 ORDER BY i
+----
+1	a
 3	ccc
+4	NULL
+5	eeeee
+
+query IT
+SELECT i, s FROM ducklake.t WHERE i < 3 ORDER BY i
+----
+1	a
+2	bb
+
+query IT
+SELECT i, s FROM ducklake.t WHERE i <= 2 ORDER BY i
+----
+1	a
+2	bb
+
+query IT
+SELECT i, s FROM ducklake.t WHERE i > 3 ORDER BY i
+----
+4	NULL
+5	eeeee
+
+query IT
+SELECT i, s FROM ducklake.t WHERE i >= 4 ORDER BY i
+----
+4	NULL
+5	eeeee
+
+query IT
+SELECT i, s FROM ducklake.t WHERE s IS NULL ORDER BY i
+----
+4	NULL
+
+query IT
+SELECT i, s FROM ducklake.t WHERE s IS NOT NULL ORDER BY i
+----
+1	a
+2	bb
+3	ccc
+5	eeeee
+
+query IT
+SELECT i, s FROM ducklake.t WHERE i IN (1, 3, 5) ORDER BY i
+----
+1	a
+3	ccc
+5	eeeee
+
+query IT
+SELECT i, s FROM ducklake.t WHERE i = 1 OR s = 'ccc' ORDER BY i
+----
+1	a
+3	ccc
+
+query I
+SELECT COUNT(*) FROM ducklake.t WHERE i = 999
+----
+0
 
 query I
 SELECT COUNT(*) FROM ducklake.t
 ----
-3
+5
 
 query I
 SELECT SUM(i) FROM ducklake.t
 ----
-6
+15
+
+# JOIN triggering DynamicFilter against JSON-backed table
+statement ok
+CREATE TEMP TABLE probe(k INTEGER)
+
+statement ok
+INSERT INTO probe VALUES (2), (5)
+
+query IT
+SELECT t.i, t.s FROM ducklake.t JOIN probe ON t.i = probe.k ORDER BY t.i
+----
+2	bb
+5	eeeee
+
+# DELETE FROM + rowid + snapshot_id + time travel on JSON-backed table
+statement ok
+SET VARIABLE snap_before_del = (SELECT MAX(snapshot_id) FROM ducklake.snapshots())
+
+statement ok
+DELETE FROM ducklake.t WHERE i = 2
+
+statement ok
+SET VARIABLE snap_after_del1 = (SELECT MAX(snapshot_id) FROM ducklake.snapshots())
+
+statement ok
+DELETE FROM ducklake.t WHERE i = 4
+
+query IIT
+SELECT rowid, i, s FROM ducklake.t ORDER BY i
+----
+0	1	a
+2	3	ccc
+4	5	eeeee
+
+query II
+SELECT COUNT(*), COUNT(DISTINCT snapshot_id) FROM ducklake.t
+----
+3	1
+
+# filtered scan combined with deletes (including matching only a deleted row)
+query IT
+SELECT i, s FROM ducklake.t WHERE i >= 2 ORDER BY i
+----
+3	ccc
+5	eeeee
+
+query I
+SELECT COUNT(*) FROM ducklake.t WHERE i = 2
+----
+0
+
+# time travel exercises snapshot_filter in delete filtering
+query I
+SELECT i FROM ducklake.t AT (VERSION => getvariable('snap_before_del')) ORDER BY i
+----
+1
+2
+3
+4
+5
+
+query I
+SELECT i FROM ducklake.t AT (VERSION => getvariable('snap_after_del1')) ORDER BY i
+----
+1
+3
+4
+5
+
+# ALTER TABLE ADD COLUMN with DEFAULT, RENAME COLUMN via BY_NAME ducklake_column_mapping, and type widening
+statement ok
+INSERT INTO ducklake_meta.ducklake_column_mapping
+SELECT 100, table_id, 'map_by_name' FROM ducklake_meta.ducklake_table WHERE table_name = 't'
+
+statement ok
+INSERT INTO ducklake_meta.ducklake_name_mapping
+SELECT 100, column_id, column_name, column_id, NULL, false
+FROM ducklake_meta.ducklake_column
+WHERE table_id = (SELECT table_id FROM ducklake_meta.ducklake_table WHERE table_name = 't')
+
+statement ok
+UPDATE ducklake_meta.ducklake_data_file
+SET mapping_id = 100
+WHERE table_id = (SELECT table_id FROM ducklake_meta.ducklake_table WHERE table_name = 't')
+
+statement ok
+DETACH ducklake
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_jr.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_jr_files', METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+ALTER TABLE ducklake.t ADD COLUMN d INTEGER DEFAULT 42
+
+statement ok
+ALTER TABLE ducklake.t RENAME COLUMN s TO label
+
+statement ok
+ALTER TABLE ducklake.t ALTER COLUMN i TYPE BIGINT
+
+query ITI
+SELECT i, label, d FROM ducklake.t ORDER BY i
+----
+1	a	42
+3	ccc	42
+5	eeeee	42
+
+query II
+SELECT i, d FROM ducklake.t WHERE d = 42 AND i > 1 ORDER BY i
+----
+3	42
+5	42
+
+# Nested STRUCT and LIST projection/mapping, NULL parent struct handling, and struct evolution
+statement ok
+CREATE TABLE ducklake.nested(id INTEGER, st STRUCT(a INTEGER, b VARCHAR), arr INTEGER[], items STRUCT(k VARCHAR, v INTEGER)[])
+
+statement ok
+INSERT INTO ducklake.nested VALUES
+    (1, {'a': 10, 'b': 'x'}, [1, 2], [{'k': 'p', 'v': 100}]),
+    (2, NULL, [3], []),
+    (3, {'a': 30, 'b': 'z'}, [], [{'k': 'q', 'v': 200}])
+
+statement ok
+COPY (SELECT id, st, arr, items FROM ducklake.nested ORDER BY id) TO '{TEST_DIR}/injected_nested.json' (FORMAT json)
+
+statement ok
+UPDATE ducklake_meta.ducklake_data_file
+SET path = '{TEST_DIR}/injected_nested.json', path_is_relative = false, file_format = 'json'
+WHERE table_id = (SELECT table_id FROM ducklake_meta.ducklake_table WHERE table_name = 'nested')
+
+statement ok
+DETACH ducklake
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_jr.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_jr_files', METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+ALTER TABLE ducklake.nested ADD COLUMN st.c INTEGER DEFAULT 7
+
+query IIII
+SELECT id, st, arr, items FROM ducklake.nested ORDER BY id
+----
+1	{'a': 10, 'b': x, 'c': 7}	[1, 2]	[{'k': p, 'v': 100}]
+2	NULL	[3]	[]
+3	{'a': 30, 'b': z, 'c': 7}	[]	[{'k': q, 'v': 200}]
+
+# Pushdown struct field extraction (both with NULL parent structs and single non-null struct) + filter on struct field
+query IITI
+SELECT id, st.a, st.b, st.c FROM ducklake.nested ORDER BY id
+----
+1	10	x	7
+2	NULL	NULL	NULL
+3	30	z	7
+
+query II
+SELECT id, st.a FROM ducklake.nested WHERE id = 1
+----
+1	10
+
+query II
+SELECT id, st.a FROM ducklake.nested WHERE st.a >= 30 ORDER BY id
+----
+3	30
+
+# Embedded _ducklake_internal_row_id and _ducklake_internal_snapshot_id columns in a JSON file
+statement ok
+CREATE TABLE ducklake.internal_cols(id INTEGER, val VARCHAR)
+
+statement ok
+INSERT INTO ducklake.internal_cols VALUES (1, 'one'), (2, 'two')
+
+statement ok
+COPY (SELECT 1::INTEGER AS id, 'one' AS val, 100::BIGINT AS _ducklake_internal_row_id, 5::BIGINT AS _ducklake_internal_snapshot_id
+      UNION ALL
+      SELECT 2::INTEGER AS id, 'two' AS val, 101::BIGINT AS _ducklake_internal_row_id, 6::BIGINT AS _ducklake_internal_snapshot_id)
+TO '{TEST_DIR}/injected_internal.json' (FORMAT json)
+
+statement ok
+UPDATE ducklake_meta.ducklake_data_file
+SET path = '{TEST_DIR}/injected_internal.json', path_is_relative = false, file_format = 'json'
+WHERE table_id = (SELECT table_id FROM ducklake_meta.ducklake_table WHERE table_name = 'internal_cols')
+
+statement ok
+DETACH ducklake
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_jr.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_jr_files', METADATA_CATALOG 'ducklake_meta')
+
+query IIIT
+SELECT rowid, snapshot_id, id, val FROM ducklake.internal_cols ORDER BY id
+----
+100	5	1	one
+101	6	2	two
+
+# Multi-file / multi-thread parallel scan (PRAGMA threads=4) across >2048 rows
+statement ok
+PRAGMA threads=4
+
+statement ok
+CREATE TABLE ducklake.multi(id INTEGER, grp INTEGER, label VARCHAR)
+
+statement ok
+INSERT INTO ducklake.multi SELECT i, i % 10, 'f1_' || i FROM range(0, 3000) r(i)
+
+statement ok
+INSERT INTO ducklake.multi SELECT i, i % 10, 'f2_' || i FROM range(3000, 6000) r(i)
+
+statement ok
+COPY (SELECT i::INTEGER AS id, (i % 10)::INTEGER AS grp, 'f1_' || i AS label FROM range(0, 3000) r(i)) TO '{TEST_DIR}/multi_1.json' (FORMAT json)
+
+statement ok
+COPY (SELECT i::INTEGER AS id, (i % 10)::INTEGER AS grp, 'f2_' || i AS label FROM range(3000, 6000) r(i)) TO '{TEST_DIR}/multi_2.json' (FORMAT json)
+
+statement ok
+UPDATE ducklake_meta.ducklake_data_file
+SET path = CASE
+        WHEN data_file_id = (SELECT MIN(data_file_id) FROM ducklake_meta.ducklake_data_file WHERE table_id = (SELECT table_id FROM ducklake_meta.ducklake_table WHERE table_name = 'multi'))
+        THEN '{TEST_DIR}/multi_1.json'
+        ELSE '{TEST_DIR}/multi_2.json'
+    END,
+    path_is_relative = false,
+    file_format = 'json'
+WHERE table_id = (SELECT table_id FROM ducklake_meta.ducklake_table WHERE table_name = 'multi')
+
+statement ok
+DETACH ducklake
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_jr.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_jr_files', METADATA_CATALOG 'ducklake_meta')
+
+query IIII
+SELECT COUNT(*), SUM(id), MIN(id), MAX(id) FROM ducklake.multi
+----
+6000	17997000	0	5999
+
+query II
+SELECT COUNT(*), SUM(id) FROM ducklake.multi WHERE grp = 3 AND id >= 2000 AND id < 4000
+----
+200	599600
+
+# Multi-file deletes + parallel filtered scan + dynamic filter join
+statement ok
+DELETE FROM ducklake.multi WHERE id % 100 = 0
+
+query I
+SELECT COUNT(*) FROM ducklake.multi
+----
+5940
+
+statement ok
+CREATE TEMP TABLE multi_probe AS SELECT (i * 50 + 3)::INTEGER AS k FROM range(10) r(i)
+
+query II
+SELECT COUNT(*), MIN(m.id) FROM ducklake.multi m JOIN multi_probe p ON m.id = p.k
+----
+10	3

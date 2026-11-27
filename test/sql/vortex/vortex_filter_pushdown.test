@@ -1,0 +1,154 @@
+# name: test/sql/vortex/vortex_filter_pushdown.test
+# description: test filter pushdown, parallel multi-thread scan, rowid, deletes, updates, and time travel on Vortex files
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+PRAGMA threads=4
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_vfp.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_vfp_files', METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+CALL ducklake.set_option('data_inlining_row_limit', 0)
+
+statement ok
+CALL ducklake.set_option('data_file_format', 'vortex')
+
+statement ok
+CREATE TABLE ducklake.t(i BIGINT, s VARCHAR, f DOUBLE)
+
+# 200k rows (~100 DuckDB vectors) in a single Vortex file to exercise parallel splits & multi-chunk scans
+statement ok
+INSERT INTO ducklake.t
+SELECT i, 'val_' || (i % 100), i * 2.5
+FROM range(200000) r(i)
+
+query I
+SELECT COUNT(*) FROM ducklake_meta.ducklake_data_file WHERE file_format = 'vortex'
+----
+1
+
+# Full parallel scan + COUNT(*)
+query IIII
+SELECT COUNT(*), SUM(i), MIN(i), MAX(i) FROM ducklake.t
+----
+200000	19999900000	0	199999
+
+query I
+SELECT COUNT(*) FROM ducklake.t
+----
+200000
+
+# Selective filter pushdown (equality, range, string, IN, IS NULL)
+query IIT
+SELECT i, CAST(FLOOR(f) AS BIGINT), s FROM ducklake.t WHERE i = 150123
+----
+150123	375307	val_23
+
+query III
+SELECT COUNT(*), MIN(i), MAX(i) FROM ducklake.t WHERE i >= 150000 AND i < 150500
+----
+500	150000	150499
+
+query III
+SELECT COUNT(*), MIN(i), MAX(i) FROM ducklake.t WHERE s = 'val_42' AND i >= 199000
+----
+10	199042	199942
+
+query II
+SELECT COUNT(*), SUM(i) FROM ducklake.t WHERE i IN (0, 50000, 199999)
+----
+3	249999
+
+query I
+SELECT COUNT(*) FROM ducklake.t WHERE i IS NULL
+----
+0
+
+# rowid across >2048 rows both unfiltered and with pushed filter (verifies virtual file_row_number)
+query IIII
+SELECT COUNT(*), MIN(rowid), MAX(rowid), BOOL_AND(rowid = i) FROM ducklake.t
+----
+200000	0	199999	true
+
+query IIII
+SELECT COUNT(*), MIN(rowid), MAX(rowid), BOOL_AND(rowid = i)
+FROM ducklake.t
+WHERE i >= 150000 AND i < 150500
+----
+500	150000	150499	true
+
+# Record snapshot version before deletes for time-travel check
+statement ok
+SET VARIABLE snap_before = (SELECT MAX(snapshot_id) FROM ducklake.snapshots())
+
+# Sparse + contiguous positional deletes across the 200k-row Vortex file
+statement ok
+DELETE FROM ducklake.t WHERE i % 1000 = 0
+
+statement ok
+DELETE FROM ducklake.t WHERE i BETWEEN 150100 AND 150199
+
+query I
+SELECT COUNT(*) FROM ducklake.t
+----
+199700
+
+# Pushed filter combined with positional deletes
+query III
+SELECT COUNT(*), MIN(i), MAX(i) FROM ducklake.t WHERE i >= 150000 AND i < 150500
+----
+399	150001	150499
+
+query I
+SELECT COUNT(*) FROM ducklake.t WHERE i = 150000 OR i = 150150
+----
+0
+
+# rowid stays accurate with deletes + pushed filter
+query IIII
+SELECT COUNT(*), MIN(rowid), MAX(rowid), BOOL_AND(rowid = i)
+FROM ducklake.t
+WHERE i >= 150000 AND i < 150500
+----
+399	150001	150499	true
+
+# UPDATE on Vortex table (delete + re-insert)
+statement ok
+UPDATE ducklake.t SET s = 'updated' WHERE i IN (5001, 150250, 199999)
+
+query IT
+SELECT i, s FROM ducklake.t WHERE s = 'updated' ORDER BY i
+----
+5001	updated
+150250	updated
+199999	updated
+
+query I
+SELECT COUNT(*) FROM ducklake.t
+----
+199700
+
+statement ok
+SET VARIABLE snap_after = (SELECT MAX(snapshot_id) FROM ducklake.snapshots())
+
+# Deletion scan across snapshots (verifies SCAN_DELETIONS + file_row_number + snapshot lookup)
+query III
+SELECT COUNT(*), MIN(i), MAX(i)
+FROM ducklake_table_deletions('ducklake', 'main', 't', getvariable('snap_before') + 1, getvariable('snap_after'))
+----
+303	0	199999
+
+# Time travel before deletes still sees all 200k rows (verifies snapshot_filter in FilterByRowNumbers)
+query III
+SELECT COUNT(*), MIN(i), MAX(i)
+FROM ducklake.t AT (VERSION => getvariable('snap_before'))
+WHERE i >= 150000 AND i < 150500
+----
+500	150000	150499

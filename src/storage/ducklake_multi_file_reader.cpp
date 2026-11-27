@@ -552,33 +552,9 @@ shared_ptr<BaseFileReader> DuckLakeMultiFileReader::TryCreateFormatReader(Client
 	}
 	auto format = StringUtil::Lower(StringValue::Get(entry->second));
 	if (format.empty() || format == "parquet") {
-		// parquet uses the native reader path
 		return nullptr;
 	}
-	auto columns = DuckLakeMultiFileReader::ColumnsFromFieldData(read_info.table.GetFieldData(), true);
-	// if the file has a name map (e.g. columns were renamed after it was written), look columns up by
-	// their physical name in the file instead of the current schema name
-	auto mapping_entry = file.extended_info->options.find("mapping_id");
-	if (mapping_entry != file.extended_info->options.end()) {
-		auto mapping_id = MappingIndex(mapping_entry->second.GetValue<idx_t>());
-		auto name_map = read_info.GetTransaction()->GetMappingById(mapping_id);
-		if (name_map) {
-			unordered_map<idx_t, string> physical_names;
-			for (auto &column_map : name_map->column_maps) {
-				physical_names[column_map->target_field_id.index] = column_map->source_name;
-			}
-			for (auto &col : columns) {
-				if (col.identifier.IsNull() || col.identifier.type().id() != LogicalTypeId::INTEGER) {
-					continue;
-				}
-				auto name_entry = physical_names.find(IntegerValue::Get(col.identifier));
-				if (name_entry != physical_names.end()) {
-					col.name = Identifier(name_entry->second);
-				}
-			}
-		}
-	}
-	return make_shared_ptr<DuckLakeFormatReader>(read_info, file, std::move(format), std::move(columns));
+	return make_shared_ptr<DuckLakeFormatReader>(context, read_info, file, std::move(format));
 }
 
 shared_ptr<BaseFileReader> DuckLakeMultiFileReader::CreateReader(ClientContext &context,
@@ -691,6 +667,24 @@ ReaderInitializeType DuckLakeMultiFileReader::CreateMapping(
 	throw InternalException("DuckLakeMultiFileReader::CreateMapping is unreachable");
 }
 
+static vector<MultiFileColumnDefinition>
+PrepareColumnsForNameMapping(const vector<MultiFileColumnDefinition> &global_columns, bool parent_is_list = false) {
+	auto result = global_columns;
+	for (auto &col : result) {
+		auto source_name = col.name.GetIdentifierName();
+		if (parent_is_list && (source_name == "array" || source_name == "element")) {
+			col.identifier = Value("list");
+		} else {
+			col.identifier = Value();
+		}
+		if (!col.children.empty()) {
+			bool is_list = col.type.id() == LogicalTypeId::LIST || col.type.id() == LogicalTypeId::ARRAY;
+			col.children = PrepareColumnsForNameMapping(col.children, is_list);
+		}
+	}
+	return result;
+}
+
 ReaderInitializeType DuckLakeMultiFileReader::CreateMappingWithGlobalState(
     ClientContext &context, MultiFileReaderData &reader_data, const vector<MultiFileColumnDefinition> &global_columns,
     const vector<ColumnIndex> &global_column_ids, optional_ptr<TableFilterSet> filters, MultiFileList &multi_file_list,
@@ -715,6 +709,12 @@ ReaderInitializeType DuckLakeMultiFileReader::CreateMappingWithGlobalState(
 		auto mapping = transaction->GetMappingById(MappingIndex(mapping_id));
 		// use the mapping to generate a new set of global columns for this file
 		auto mapped_columns = CreateNewMapping(context, reader_data, global_columns, *mapping);
+		return MultiFileReader::CreateMapping(context, reader_data, mapped_columns, column_ids_to_use, filters,
+		                                      multi_file_list, bind_data, virtual_columns,
+		                                      MultiFileColumnMappingMode::BY_NAME);
+	}
+	if (dynamic_cast<DuckLakeFormatReader *>(reader_data.reader.get())) {
+		auto mapped_columns = PrepareColumnsForNameMapping(global_columns);
 		return MultiFileReader::CreateMapping(context, reader_data, mapped_columns, column_ids_to_use, filters,
 		                                      multi_file_list, bind_data, virtual_columns,
 		                                      MultiFileColumnMappingMode::BY_NAME);
@@ -746,7 +746,12 @@ MultiFileReaderVirtualColumnBinding DuckLakeMultiFileReader::GetVirtualColumnExp
 		// row id column
 		// this is computed as row_id_start + file_row_number OR read from the file
 		// first check if the row id is explicitly defined in this file
-		if (FindColumnByFieldId(local_columns, MultiFileReader::ROW_ID_FIELD_ID).IsValid()) {
+		auto row_id_col = FindColumnByFieldId(local_columns, MultiFileReader::ROW_ID_FIELD_ID);
+		if (row_id_col.IsValid()) {
+			if (dynamic_cast<DuckLakeFormatReader *>(reader_data.reader.get())) {
+				auto ref = make_uniq<BoundReferenceExpression>(type, local_idx.GetIndex());
+				return MultiFileReaderVirtualColumnBinding(std::move(ref), {row_id_col.GetIndex()});
+			}
 			return MultiFileReaderVirtualColumnBinding(*row_id_column.get());
 		}
 		// get the row id start for this file
@@ -778,8 +783,12 @@ MultiFileReaderVirtualColumnBinding DuckLakeMultiFileReader::GetVirtualColumnExp
 		// a data file embeds the insert snapshot of each row, a deletion scan reports the snapshot of its delete
 		bool scans_deleted_rows =
 		    read_info.scan_type == DuckLakeScanType::SCAN_DELETIONS && reader_data.reader->deletion_filter;
-		if (!scans_deleted_rows &&
-		    FindColumnByFieldId(local_columns, MultiFileReader::LAST_UPDATED_SEQUENCE_NUMBER_ID).IsValid()) {
+		auto snapshot_col = FindColumnByFieldId(local_columns, MultiFileReader::LAST_UPDATED_SEQUENCE_NUMBER_ID);
+		if (!scans_deleted_rows && snapshot_col.IsValid()) {
+			if (dynamic_cast<DuckLakeFormatReader *>(reader_data.reader.get())) {
+				auto ref = make_uniq<BoundReferenceExpression>(type, local_idx.GetIndex());
+				return MultiFileReaderVirtualColumnBinding(std::move(ref), {snapshot_col.GetIndex()});
+			}
 			return MultiFileReaderVirtualColumnBinding(*snapshot_id_column.get());
 		}
 		// get the row id start for this file

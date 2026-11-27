@@ -8,10 +8,12 @@
 
 #pragma once
 
+#include "duckdb/common/atomic.hpp"
 #include "duckdb/common/multi_file/base_file_reader.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/planner/table_filter_state.hpp"
 
 namespace duckdb {
 struct DuckLakeFunctionInfo;
@@ -20,16 +22,25 @@ struct DuckLakeFunctionInfo;
 enum class FormatReaderColumn : uint8_t {
 	FILE_COLUMN, //! read from the file (see output_source_index)
 	ORDINAL,     //! file_row_number, emitted by the reader
-	MISSING      //! not in the file -> NULL
+	EMPTY        //! placeholder column not populated from the file
+};
+
+//! Per-worker state for scanning a format reader concurrently.
+struct FormatReaderThreadState {
+	unique_ptr<ThreadContext> thread_context;
+	unique_ptr<ExecutionContext> execution_context;
+	unique_ptr<LocalTableFunctionState> local_state;
+	DataChunk scan_chunk;
+	unordered_map<idx_t, unique_ptr<ExpressionExecutor>> expression_executors;
+	vector<pair<idx_t, unique_ptr<TableFilterState>>> filter_states;
 };
 
 //! Reads a single non-parquet DuckLake data file ("vortex", "json", ...) by driving its read_<format>
-//! table function and adapting the chunks to DuckLake's MultiFileReader contract (column mapping,
-//! delete filters, pushed-down filters, file_row_number), like the parquet reader path does.
+//! table function and adapting the chunks to DuckLake's MultiFileReader contract.
 class DuckLakeFormatReader : public BaseFileReader {
 public:
-	DuckLakeFormatReader(DuckLakeFunctionInfo &read_info, const OpenFileInfo &info, string format,
-	                     vector<MultiFileColumnDefinition> columns);
+	DuckLakeFormatReader(ClientContext &context, DuckLakeFunctionInfo &read_info, const OpenFileInfo &info,
+	                     string format);
 
 public:
 	bool TryInitializeScan(ClientContext &context, GlobalTableFunctionState &gstate,
@@ -41,32 +52,39 @@ public:
 
 private:
 	static TableFunction GetReadFunction(ClientContext &context, const string &format);
-	bool TryEvaluateExpression(ClientContext &context, idx_t virtual_col_idx, Vector &input_vector,
-	                           const LogicalType &input_type, idx_t count, Vector &output_vector);
+	void InitializeGlobalScan(ClientContext &context);
+	bool TryEvaluateExpression(ClientContext &context, FormatReaderThreadState &thread_state, idx_t output_col_idx,
+	                           Vector &input_vector, const LogicalType &input_type, idx_t count, Vector &output_vector);
 
 	mutex lock;
 	DuckLakeFunctionInfo &read_info;
-	string format; //! selects the read_<format> function
-	bool initialized_scan = false;
-	int64_t file_row_number = 0;
+	string format;
 
-	//! read_<format> scan bound to the file
 	TableFunction file_scan;
 	unique_ptr<FunctionData> bind_data;
 	vector<LogicalType> file_types;
 	vector<Identifier> file_names;
+	bool supports_file_row_number = false;
+	bool supports_empty_column = false;
+	LogicalType file_row_number_type = LogicalType::UBIGINT;
 
-	unique_ptr<ThreadContext> thread_context;
-	unique_ptr<ExecutionContext> execution_context;
+	bool initialized_global = false;
+	bool use_virtual_file_row_number = false;
+	idx_t max_threads = 1;
+	idx_t claimed_threads = 0;
+	atomic<bool> scan_exhausted {false};
+	int64_t file_row_number = 0;
+
+	vector<column_t> scan_column_ids;
+	vector<LogicalType> scan_types;
+	optional_idx file_row_number_scan_idx;
+	vector<FormatReaderColumn> output_kinds;
+	vector<idx_t> output_source_index;
+	vector<vector<idx_t>> output_extract_paths;
+
+	unique_ptr<TableFilterSet> pushed_filters;
 	unique_ptr<GlobalTableFunctionState> global_state;
-	unique_ptr<LocalTableFunctionState> local_state;
-
-	vector<column_t> scan_column_ids;        //! columns projected out of the file
-	DataChunk scan_chunk;                    //! raw columns read from the file
-	vector<FormatReaderColumn> output_kinds; //! how each output column is produced
-	vector<idx_t> output_source_index;       //! for FILE_COLUMN: position in scan_chunk
-	//! Expression executors for expression_map entries, keyed by column_t (from column_ids)
-	unordered_map<column_t, unique_ptr<ExpressionExecutor>> expression_executors;
+	unordered_map<LocalTableFunctionState *, unique_ptr<FormatReaderThreadState>> thread_states;
 };
 
 } // namespace duckdb
